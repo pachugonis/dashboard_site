@@ -14,10 +14,14 @@
     --text: #e7e9f5;
     --muted: #949bc4;
     --dim: #5d6390;
+    /* Статусные цвета: только состояние, всегда рядом со словом. */
     --up: #3ecfa0;
     --down: #ff5d73;
     --slow: #f2b64c;
+    /* Цвета данных в ленте: проверены validate_palette.js на панели #161a2c
+       (полоса светлоты, CVD-разделение, контраст). Не путать со статусными. */
     --circuit: #8f7bff;
+    --svc: #31a883;
     --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   }
@@ -28,7 +32,7 @@
     background-image: radial-gradient(circle at 15% -10%, #1d2244 0%, transparent 55%);
     background-attachment: fixed;
   }
-  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 28px 20px 64px; }
 
   .eyebrow {
     font-family: var(--mono); font-size: 11px; letter-spacing: .18em;
@@ -42,92 +46,104 @@
   .meta { display: flex; gap: 22px; flex-wrap: wrap; align-items: center;
     font-family: var(--mono); font-size: 12px; color: var(--muted); }
   .meta b { color: var(--text); font-weight: 600; }
+  .meta a { color: var(--muted); }
   .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block;
     margin-right: 7px; vertical-align: 1px; background: var(--dim); }
   .dot.on { background: var(--up); box-shadow: 0 0 0 3px rgba(62,207,160,.16); }
   .dot.off { background: var(--down); box-shadow: 0 0 0 3px rgba(255,93,115,.16); }
 
-  .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 20px 0 14px; }
+  /* Сводка: три числа, которыми дашборд открывается. */
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 10px; margin: 22px 0 6px; }
+  .kpi { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 14px 16px; }
+  .kpi .v { font-size: 40px; line-height: 1.05; font-weight: 600;
+    font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+  .kpi .k { font-family: var(--mono); font-size: 10px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--dim); margin-top: 4px; }
+  .kpi.ok .v { color: var(--up); } .kpi.bad .v { color: var(--down); }
+  .kpi.wait .v { color: var(--muted); }
+
+  .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 18px 0 16px; }
   input[type=search], .btn {
     font: inherit; font-size: 13px; color: var(--text); background: var(--panel);
     border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
   }
   input[type=search] { min-width: 220px; flex: 1 1 220px; font-family: var(--mono); }
   input[type=search]::placeholder { color: var(--dim); }
-  .btn { cursor: pointer; }
+  .btn { cursor: pointer; text-decoration: none; display: inline-block; }
   .btn:hover { background: var(--panel-2); border-color: #3a4270; }
   .btn[aria-pressed="true"] { border-color: var(--circuit); color: #fff;
     background: linear-gradient(var(--panel-2), var(--panel)); }
   :focus-visible { outline: 2px solid var(--circuit); outline-offset: 2px; }
 
-  .row {
-    display: grid; gap: 4px 18px; align-items: center;
-    grid-template-columns: minmax(220px, 1.4fr) 88px 88px 1fr 92px;
-    grid-template-areas: "id day week tape act";
-    background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--dim);
-    border-radius: 10px; padding: 14px 16px; margin-bottom: 8px;
-  }
-  .row.up { border-left-color: var(--up); }
-  .row.down { border-left-color: var(--down); }
-  .row.pending { border-left-color: var(--dim); }
+  /* Окна: по одному на сервис. */
+  .grid { display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line);
+    border-top: 3px solid var(--dim); border-radius: 12px; padding: 16px 18px 14px;
+    display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+  .card.up { border-top-color: var(--up); }
+  .card.down { border-top-color: var(--down); }
+  .card.pending { border-top-color: var(--dim); }
 
-  .id { grid-area: id; min-width: 0; }
-  .name { font-weight: 600; display: flex; align-items: center; gap: 8px; }
-  .name .pill {
-    font-family: var(--mono); font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
-    padding: 2px 6px; border-radius: 4px; border: 1px solid currentColor; opacity: .9;
-  }
-  .up .pill { color: var(--up); }
-  .down .pill { color: var(--down); }
-  .pending .pill { color: var(--dim); }
-  .addr { font-family: var(--mono); font-size: 12px; color: var(--muted);
+  .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .name { font-weight: 600; font-size: 16px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .addr { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .err { font-size: 12.5px; color: var(--down); margin-top: 4px; }
-  .note { font-size: 12.5px; color: var(--dim); margin-top: 2px; }
+  /* Статус — цвет плюс слово: по одному цвету состояние читать нельзя. */
+  .pill { font-family: var(--mono); font-size: 10px; letter-spacing: .08em;
+    text-transform: uppercase; padding: 3px 7px; border-radius: 5px;
+    border: 1px solid currentColor; white-space: nowrap; flex: none; }
+  .up .pill { color: var(--up); } .down .pill { color: var(--down); }
+  .pending .pill { color: var(--dim); }
 
-  .stat { text-align: right; font-family: var(--mono); }
-  .stat .v { font-size: 17px; font-variant-numeric: tabular-nums; }
-  .stat .k { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--dim); }
-  .stat.day { grid-area: day; } .stat.week { grid-area: week; }
+  .figures { display: flex; align-items: baseline; gap: 18px; }
+  .fig .v { font-size: 30px; font-weight: 600; font-variant-numeric: tabular-nums;
+    letter-spacing: -.02em; line-height: 1.1; }
+  .fig.small .v { font-size: 17px; color: var(--muted); }
+  .fig .k { font-family: var(--mono); font-size: 10px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--dim); }
   .v.good { color: var(--up); } .v.warn { color: var(--slow); } .v.bad { color: var(--down); }
   .v.none { color: var(--dim); }
 
-  /* Подпись: лента проверок. Нижняя часть штриха — построение цепочки Tor,
-     верхняя — ответ самого сервиса. */
-  .signal { grid-area: tape; min-width: 0; }
-  .tape { display: flex; align-items: flex-end; gap: 2px; height: 44px;
+  /* Лента проверок. Нижняя часть штриха — построение цепочки Tor,
+     верхняя — ответ самого сервиса. Порядок частей всегда один и тот же. */
+  .tape { display: flex; align-items: flex-end; gap: 2px; height: 40px;
     padding: 0 2px; border-bottom: 1px solid var(--line); }
   .tick { flex: 1 1 0; min-width: 2px; display: flex; flex-direction: column;
     justify-content: flex-end; height: 100%; }
-  .tick i { display: block; border-radius: 1px; }
-  .tick .svc { background: var(--up); }
-  .tick .cir { background: var(--circuit); opacity: .75; }
-  .tick.bad i { background: var(--down); }
+  .tick i { display: block; border-radius: 2px 2px 0 0; }
+  .tick .svc { background: var(--svc); margin-bottom: 2px; border-radius: 2px; }
+  .tick .cir { background: var(--circuit); }
+  .tick.bad i { background: var(--down); border-radius: 2px 2px 0 0; }
   .tick.empty i { background: var(--line); }
   .legend { font-family: var(--mono); font-size: 10px; color: var(--dim);
-    letter-spacing: .1em; text-transform: uppercase; margin-top: 6px;
-    display: flex; justify-content: space-between; }
+    letter-spacing: .06em; text-transform: uppercase; margin-top: 7px;
+    display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
   .legend b { font-weight: 400; color: var(--muted); }
   .legend .sw { display: inline-block; width: 7px; height: 7px; border-radius: 2px;
     margin-right: 4px; vertical-align: 0; }
 
-  .act { grid-area: act; text-align: right; }
-  .act .btn { padding: 6px 10px; font-size: 12px; }
+  .err { font-size: 12.5px; color: var(--down); }
+  .note { font-size: 12.5px; color: var(--dim); }
+  .foot-row { display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; margin-top: auto; padding-top: 4px; }
+  .when { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .foot-row .btn { padding: 6px 10px; font-size: 12px; }
 
-  .empty { border: 1px dashed var(--line); border-radius: 10px; padding: 40px 24px;
-    text-align: center; color: var(--muted); }
+  /* Именно .empty-state, а не .empty: короткое имя пересекается с .tick.empty
+     в ленте и разносит пустые штрихи в дашед-боксы. */
+  .empty-state { border: 1px dashed var(--line); border-radius: 12px; padding: 44px 24px;
+    text-align: center; color: var(--muted); grid-column: 1 / -1; }
+  .empty-state a { color: var(--circuit); }
   .banner { border: 1px solid var(--down); background: rgba(255,93,115,.08);
     border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; font-size: 14px; }
   footer { margin-top: 26px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
 
-  @media (max-width: 820px) {
-    .row { grid-template-columns: 1fr 88px 88px;
-      grid-template-areas: "id day week" "tape tape tape" "act act act"; }
-    .tape { margin-top: 10px; }
-    .act { text-align: left; }
-  }
   @media (prefers-reduced-motion: no-preference) {
-    .row { transition: border-color .25s ease; }
+    .card { transition: border-color .25s ease; }
   }
 </style>
 </head>
@@ -142,15 +158,18 @@
     <div class="meta" id="meta"></div>
   </header>
 
+  <section class="kpis" id="kpis" aria-label="Сводка"></section>
+
   <div class="controls">
     <input type="search" id="filter" placeholder="фильтр по имени или адресу" aria-label="Фильтр">
     <button class="btn" id="only-down" aria-pressed="false">Только недоступные</button>
     <button class="btn" id="refresh">Обновить</button>
     <button class="btn" id="auto" aria-pressed="true">Автообновление: вкл</button>
+    <a class="btn" href="/admin">Админка</a>
   </div>
 
   <div id="banner"></div>
-  <div id="list"></div>
+  <div class="grid" id="list"></div>
 
   <footer id="foot"></footer>
 </div>
@@ -164,7 +183,7 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
 const ms = v => v == null ? "—" : (v >= 10000 ? (v/1000).toFixed(1) + " с" : Math.round(v) + " мс");
 const pct = v => v == null ? "—" : (v >= 99.95 ? "100" : v.toFixed(v >= 10 ? 1 : 2)) + "%";
 const ago = ts => {
-  if (!ts) return "никогда";
+  if (!ts) return "ещё не проверялся";
   const d = Math.max(0, Date.now()/1000 - ts);
   if (d < 60) return Math.round(d) + " с назад";
   if (d < 3600) return Math.round(d/60) + " мин назад";
@@ -184,49 +203,66 @@ function tape(history) {
     const when = clock(h.ts);
     if (!h.ok) {
       const why = h.error || h.error_slug || "недоступен";
-      return `<span class="tick bad" title="${esc(when)} — ${esc(why)}"><i style="height:100%"></i></span>`;
+      return `<span class="tick bad" title="${esc(when)} — сбой: ${esc(why)}"><i style="height:100%"></i></span>`;
     }
     const circuit = h.connect_ms || 0;
-    const svc = Math.max(0, (h.ttfb_ms || circuit) - circuit);
     const scale = v => Math.max(2, Math.min(100, Math.round(100 * v / worst)));
-    const hc = scale(circuit), hs = Math.min(100 - hc, scale(svc));
-    const tip = `${when} — HTTP ${h.status ?? "ok"} · цепочка ${ms(circuit)} · ответ ${ms(svc)}`;
+    const hc = scale(circuit);
+    // В режиме tcp ответа нет вообще (ttfb_ms пуст) — рисуем только цепочку,
+    // иначе зелёная полоска обозначала бы несуществующее время ответа.
+    const svc = h.ttfb_ms == null ? null : Math.max(0, h.ttfb_ms - circuit);
+    const hs = svc ? Math.min(100 - hc, scale(svc)) : 0;
+    const tip = svc == null
+      ? `${when} — поток открыт · цепочка ${ms(circuit)}`
+      : `${when} — HTTP ${h.status ?? "ok"} · цепочка ${ms(circuit)} · ответ ${ms(svc)}`;
     return `<span class="tick" title="${esc(tip)}">`
-         + `<i class="svc" style="height:${hs}%"></i><i class="cir" style="height:${hc}%"></i></span>`;
+         + (hs ? `<i class="svc" style="height:${hs}%"></i>` : "")
+         + `<i class="cir" style="height:${hc}%"></i></span>`;
   }).join("");
 }
 
-function row(t) {
+function card(t) {
   const last = t.last;
   const status = !last ? "pending" : (last.ok ? "up" : "down");
-  const word = status === "up" ? "доступен" : status === "down" ? "недоступен" : "не проверялся";
+  const word = status === "up" ? "доступен" : status === "down" ? "недоступен" : "в очереди";
+  const d = t.day, w = t.week;
   const detail = last && !last.ok
     ? `<div class="err">${esc(last.error || "недоступен")}</div>` : "";
   const note = t.note ? `<div class="note">${esc(t.note)}</div>` : "";
-  const d = t.day, w = t.week;
-  return `<article class="row ${status}" data-name="${esc(t.name)}">
-    <div class="id">
-      <div class="name">${esc(t.name)} <span class="pill">${word}</span></div>
-      <div class="addr" title="${esc(t.url)}">${esc(t.host)}${t.port !== 80 ? ":" + t.port : ""}</div>
-      ${detail}${note}
+  const port = (t.port !== 80 && t.port !== 443) ? ":" + t.port : "";
+  return `<article class="card ${status}" data-name="${esc(t.name)}">
+    <div class="head">
+      <div style="min-width:0">
+        <div class="name" title="${esc(t.name)}">${esc(t.name)}</div>
+        <div class="addr" title="${esc(t.url)}">${esc(t.host)}${port}</div>
+      </div>
+      <span class="pill">${word}</span>
     </div>
-    <div class="stat day">
-      <div class="v ${grade(d.uptime)}">${pct(d.uptime)}</div>
-      <div class="k">24 часа</div>
-    </div>
-    <div class="stat week">
-      <div class="v ${grade(w.uptime)}">${pct(w.uptime)}</div>
-      <div class="k">7 дней</div>
-    </div>
-    <div class="signal">
-      <div class="tape">${tape(t.history)}</div>
-      <div class="legend">
-        <span><span class="sw" style="background:var(--circuit)"></span>цепочка <b>${ms(d.avg_circuit_ms)}</b>
-              &nbsp; <span class="sw" style="background:var(--up)"></span>ответ <b>${ms(d.avg_ttfb_ms)}</b></span>
-        <span>${last ? esc(ago(last.ts)) : "—"} · раз в ${Math.round(t.interval/60)} мин</span>
+
+    <div class="figures">
+      <div class="fig">
+        <div class="v ${grade(d.uptime)}">${pct(d.uptime)}</div>
+        <div class="k">аптайм 24 ч</div>
+      </div>
+      <div class="fig small">
+        <div class="v ${grade(w.uptime)}">${pct(w.uptime)}</div>
+        <div class="k">7 дней</div>
       </div>
     </div>
-    <div class="act">
+
+    ${detail}${note}
+
+    <div>
+      <div class="tape">${tape(t.history)}</div>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--circuit)"></span>цепочка <b>${ms(d.avg_circuit_ms)}</b></span>
+        <span><span class="sw" style="background:var(--svc)"></span>ответ <b>${ms(d.avg_ttfb_ms)}</b></span>
+        <span>${d.checks} проверок</span>
+      </div>
+    </div>
+
+    <div class="foot-row">
+      <span class="when">${last ? esc(ago(last.ts)) : "ещё не проверялся"} · раз в ${Math.round(t.interval/60)} мин</span>
       <button class="btn recheck" data-name="${esc(t.name)}" ${t.checking ? "disabled" : ""}>
         ${t.checking ? "проверяю…" : "Проверить"}
       </button>
@@ -243,24 +279,33 @@ function render() {
 
   el("meta").innerHTML =
     `<span><span class="dot ${state.tor_ok ? "on" : "off"}"></span>tor ${esc(state.tor_socks)}</span>`
-    + `<span>доступно <b>${state.up}/${state.total}</b></span>`
     + `<span>обновлено ${clock(state.generated_at)}</span>`;
+
+  el("kpis").innerHTML = state.total ? [
+    `<div class="kpi ok"><div class="v">${state.up}</div><div class="k">доступно</div></div>`,
+    `<div class="kpi bad"><div class="v">${state.down}</div><div class="k">недоступно</div></div>`,
+    `<div class="kpi wait"><div class="v">${state.pending}</div><div class="k">ещё не проверялись</div></div>`,
+  ].join("") : "";
 
   el("banner").innerHTML = state.tor_ok ? "" :
     `<div class="banner">SOCKS-порт Tor не отвечает по адресу ${esc(state.tor_socks)}.
      Проверки будут падать, пока демон tor не запущен.</div>`;
 
-  el("list").innerHTML = list.length ? list.map(row).join("")
-    : `<div class="empty">Ничего не совпало с фильтром.</div>`;
+  el("list").innerHTML = list.length ? list.map(card).join("")
+    : (state.total
+        ? `<div class="empty-state">Ничего не совпало с фильтром.</div>`
+        : `<div class="empty-state">Ни одной цели пока нет.<br>
+           Добавьте onion-адреса в <a href="/admin">админке</a>.</div>`);
 
   el("foot").textContent =
     `цели проверяются через SOCKS5 локального Tor · история хранится в SQLite · `
-    + `следующее автообновление через ${REFRESH_MS/1000} с`;
+    + `автообновление каждые ${REFRESH_MS/1000} с`;
 }
 
 async function load() {
   try {
     const r = await fetch("/api/state", { cache: "no-store" });
+    if (r.status === 401) { location.href = "/admin"; return; }
     if (!r.ok) throw new Error("HTTP " + r.status);
     state = await r.json();
     render();

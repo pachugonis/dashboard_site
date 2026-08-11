@@ -11,6 +11,7 @@ set -euo pipefail
 
 APP_DIR=/opt/onionwatch
 CFG_DIR=/etc/onionwatch
+STATE_DIR=/var/lib/onionwatch
 USER_NAME=onionwatch
 TOR_SOURCE=torproject
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +22,7 @@ die() { printf '\033[1;31mОшибка:\033[0m %s\n' "$1" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || die "нужны права root: sudo ./install.sh"
 if [[ ${1:-} == "--universe" ]]; then TOR_SOURCE=universe; fi
 
-for f in onionwatch.py dashboard.html onionwatch.service config.example.json; do
+for f in onionwatch.py dashboard.html admin.html onionwatch.service config.example.json; do
   [[ -f "${SRC_DIR}/${f}" ]] || die "рядом со скриптом нет файла ${f}"
 done
 
@@ -73,18 +74,17 @@ install -d -o root -g "${USER_NAME}" -m 0750 "${CFG_DIR}"
 say "Копирую файлы приложения"
 install -o root -g root -m 0644 "${SRC_DIR}/onionwatch.py"  "${APP_DIR}/onionwatch.py"
 install -o root -g root -m 0644 "${SRC_DIR}/dashboard.html" "${APP_DIR}/dashboard.html"
+install -o root -g root -m 0644 "${SRC_DIR}/admin.html"     "${APP_DIR}/admin.html"
 if [[ -f "${SRC_DIR}/README.md" ]]; then
   install -m 0644 "${SRC_DIR}/README.md" "${APP_DIR}/README.md"
 fi
 
 if [[ ! -f "${CFG_DIR}/config.json" ]]; then
-  sed -e 's#"db_path": "onionwatch.db"#"db_path": "/var/lib/onionwatch/onionwatch.db"#' \
+  sed -e "s#\"db_path\": \"onionwatch.db\"#\"db_path\": \"${STATE_DIR}/onionwatch.db\"#" \
       "${SRC_DIR}/config.example.json" > "${CFG_DIR}/config.json"
   chown root:"${USER_NAME}" "${CFG_DIR}/config.json"
   chmod 0640 "${CFG_DIR}/config.json"
-  NEW_CONFIG=1
 else
-  NEW_CONFIG=0
   say "Конфиг ${CFG_DIR}/config.json уже есть — не трогаю"
 fi
 
@@ -93,18 +93,36 @@ install -m 0644 "${SRC_DIR}/onionwatch.service" /etc/systemd/system/onionwatch.s
 systemctl daemon-reload
 systemctl enable onionwatch.service >/dev/null
 
-if [[ ${NEW_CONFIG} -eq 1 ]]; then
-  cat <<EOF
+# Каталог базы обычно создаёт systemd (StateDirectory), но администратора
+# нужно завести до первого старта — создаём каталог сами.
+install -d -o "${USER_NAME}" -g "${USER_NAME}" -m 0750 "${STATE_DIR}"
 
-Установка завершена, но сервис ещё не запущен: в конфиге стоят адреса-заглушки.
+systemctl restart onionwatch
+say "Сервис запущен: systemctl status onionwatch"
 
-  1. sudo nano ${CFG_DIR}/config.json      # впишите свои .onion-адреса
-  2. sudo systemctl start onionwatch
-  3. sudo systemctl status onionwatch
-  4. с ноутбука: ssh -N -L 8088:127.0.0.1:8088 $(logname 2>/dev/null || echo user)@<IP-сервера>
-     и откройте http://127.0.0.1:8088/
-EOF
-else
-  systemctl restart onionwatch
-  say "Сервис перезапущен: systemctl status onionwatch"
+# Целей в конфиге больше нет: они заводятся в админке, а вход в неё — по
+# логину и паролю. Без администратора добавить их будет некому.
+ADMINS=$(sqlite3 "${STATE_DIR}/onionwatch.db" \
+         "SELECT COUNT(*) FROM admins" 2>/dev/null || echo 0)
+if [[ ${ADMINS} -eq 0 ]]; then
+  if [[ -t 0 ]]; then
+    say "Создаю администратора для входа в админку"
+    sudo -u "${USER_NAME}" /usr/bin/python3 "${APP_DIR}/onionwatch.py" \
+         --config "${CFG_DIR}/config.json" --set-admin admin || \
+      printf 'Администратор не создан, повторите команду вручную.\n' >&2
+  else
+    printf '\nАдминистратор не создан (запуск без терминала). Выполните:\n  sudo -u %s python3 %s/onionwatch.py --config %s/config.json --set-admin admin\n' \
+           "${USER_NAME}" "${APP_DIR}" "${CFG_DIR}" >&2
+  fi
 fi
+
+cat <<EOF
+
+Готово. Дальше:
+
+  1. с ноутбука: ssh -N -L 8088:127.0.0.1:8088 $(logname 2>/dev/null || echo user)@<IP-сервера>
+  2. откройте http://127.0.0.1:8088/admin и войдите под созданным логином
+  3. добавьте onion-адреса — они сразу попадут на дашборд http://127.0.0.1:8088/
+
+Конфиг ${CFG_DIR}/config.json задаёт только порты, интервалы и таймауты.
+EOF

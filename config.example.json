@@ -1,4 +1,6 @@
 {
+  "_комментарий": "Адреса onion-сервисов здесь больше не задаются — они заводятся в админке (/admin) и хранятся в базе. Этот файл описывает только инфраструктуру.",
+
   "tor_socks": "127.0.0.1:9050",
   "listen": "127.0.0.1:8088",
   "db_path": "onionwatch.db",
@@ -9,33 +11,6 @@
   "retention_days": 30,
   "isolate_circuits": true,
 
-  "targets": [
-    {
-      "name": "my-blog",
-      "url": "http://ВАШ-АДРЕС-1.onion/",
-      "expect_status": [200],
-      "expect_text": "<title>",
-      "note": "основной сайт"
-    },
-    {
-      "name": "my-blog-health",
-      "url": "http://ВАШ-АДРЕС-1.onion/healthz",
-      "expect_status": [200],
-      "expect_text": "ok",
-      "interval": 120
-    },
-    {
-      "name": "mirror-https",
-      "url": "https://ВАШ-АДРЕС-2.onion/",
-      "expect_status": [200, 301, 302],
-      "timeout": 90
-    },
-    {
-      "name": "ssh-bastion",
-      "url": "tcp://ВАШ-АДРЕС-3.onion:22",
-      "mode": "tcp",
-      "interval": 600,
-      "note": "проверяется только открытие потока"
-    }
-  ]
+  "require_login": false,
+  "session_hours": 12
 }

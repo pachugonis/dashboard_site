@@ -3,21 +3,28 @@
 onionwatch — монитор доступности onion-сервисов (Tor hidden services).
 
 Проверяет каждый адрес через SOCKS5-порт локального Tor, пишет историю
-в SQLite и отдаёт веб-дашборд + JSON API.
+в SQLite и отдаёт веб-дашборд + JSON API. Цели заводятся в админке
+(вход по логину и паролю), конфиг задаёт только инфраструктуру.
 
 Зависимости: только стандартная библиотека Python 3.11+ и запущенный tor.
 
-    python3 onionwatch.py --config config.json          # демон + дашборд
-    python3 onionwatch.py --config config.json --once   # один прогон в консоль
+    python3 onionwatch.py --config config.json              # демон + дашборд
+    python3 onionwatch.py --config config.json --once       # один прогон в консоль
+    python3 onionwatch.py --config config.json --set-admin admin   # завести админа
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
+import hashlib
+import hmac
+import http.cookies
 import json
 import os
 import random
+import re
 import secrets
 import sqlite3
 import ssl
@@ -30,9 +37,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-UA = "onionwatch/1.0"
+UA = "onionwatch/2.0"
 
 # Коды ответа SOCKS5: стандартные (RFC 1928) + расширения Tor (prop304).
+# Расширенные коды 0xF0–0xF7 Tor присылает, только если в torrc у SocksPort
+# выставлен флаг ExtendedErrors; иначе всё схлопывается в 0x01.
 SOCKS_ERRORS = {
     0x01: ("general_failure", "Общий сбой SOCKS-прокси"),
     0x02: ("not_allowed", "Соединение запрещено правилами прокси"),
@@ -52,6 +61,13 @@ SOCKS_ERRORS = {
     0xF7: ("intro_timeout", "Таймаут на introduction point"),
 }
 
+# Параметры scrypt для паролей администраторов (~16 МБ памяти на проверку).
+SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32, "maxmem": 64 * 1024 * 1024}
+
+ONION_V3 = re.compile(r"^[a-z2-7]{56}\.onion$")
+NAME_RE = re.compile(r"^[^/\\\x00-\x1f]{1,64}$")
+MAX_BODY = 64 * 1024
+
 
 class ProxyDown(Exception):
     """SOCKS-порт Tor не принимает соединения."""
@@ -62,6 +78,10 @@ class SocksError(Exception):
         self.code = code
         self.slug, self.message = SOCKS_ERRORS.get(code, ("socks_error", f"Код SOCKS 0x{code:02X}"))
         super().__init__(f"{self.message} (0x{code:02X})")
+
+
+class Invalid(ValueError):
+    """Некорректные данные от пользователя — отдаём как 400, а не как 500."""
 
 
 # --------------------------------------------------------------------------
@@ -78,6 +98,8 @@ class Target:
     expect_text: str | None = None
     mode: str = "http"          # http | tcp
     note: str = ""
+    id: int = 0
+    enabled: bool = True
     # разобранный url
     host: str = ""
     port: int = 80
@@ -93,7 +115,7 @@ class Target:
         if u.query:
             self.path += "?" + u.query
         if not self.host:
-            raise ValueError(f"{self.name}: не удалось разобрать адрес {self.url!r}")
+            raise Invalid(f"{self.name}: не удалось разобрать адрес {self.url!r}")
 
     @property
     def label(self) -> str:
@@ -113,7 +135,9 @@ class Config:
     concurrency: int = 6
     retention_days: int = 30
     isolate_circuits: bool = True
-    targets: list[Target] = field(default_factory=list)
+    require_login: bool = False      # закрыть логином и сам дашборд, не только админку
+    session_hours: int = 12
+    seed_targets: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _hostport(value: str, default_port: int) -> tuple[str, int]:
@@ -136,30 +160,112 @@ def load_config(path: str) -> Config:
     cfg.concurrency = int(raw.get("concurrency", cfg.concurrency))
     cfg.retention_days = int(raw.get("retention_days", cfg.retention_days))
     cfg.isolate_circuits = bool(raw.get("isolate_circuits", True))
+    cfg.require_login = bool(raw.get("require_login", False))
+    cfg.session_hours = int(raw.get("session_hours", cfg.session_hours))
+    # targets в конфиге больше не нужны: они живут в базе и заводятся в админке.
+    # Если они там есть, при первом запуске (пустая таблица) их импортируем.
+    cfg.seed_targets = list(raw.get("targets", []))
 
     if not cfg.db_path.startswith("/"):
         cfg.db_path = os.path.join(os.path.dirname(os.path.abspath(path)), cfg.db_path)
-
-    seen: set[str] = set()
-    for item in raw.get("targets", []):
-        t = Target(
-            name=item["name"],
-            url=item["url"],
-            interval=int(item.get("interval", cfg.interval)),
-            timeout=float(item.get("timeout", cfg.timeout)),
-            expect_status=list(item.get("expect_status", [200])),
-            expect_text=item.get("expect_text"),
-            mode=item.get("mode", "http"),
-            note=item.get("note", ""),
-        )
-        if t.name in seen:
-            raise ValueError(f"Дублирующееся имя цели: {t.name}")
-        seen.add(t.name)
-        cfg.targets.append(t)
-
-    if not cfg.targets:
-        raise ValueError("В конфиге нет ни одной цели (targets)")
     return cfg
+
+
+# --------------------------------------------------------------------------
+# Валидация целей
+# --------------------------------------------------------------------------
+
+def clean_target(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
+    """Приводит форму админки к полям таблицы. Бросает Invalid с текстом для UI."""
+    name = str(data.get("name", "")).strip()
+    if not NAME_RE.match(name):
+        raise Invalid("Имя: от 1 до 64 символов, без «/» и «\\»")
+
+    url = str(data.get("url", "")).strip()
+    if not url:
+        raise Invalid("Укажите адрес сервиса")
+    if "://" not in url:
+        url = "http://" + url
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in ("http", "https", "tcp"):
+        raise Invalid(f"Схема {u.scheme!r} не поддерживается: только http, https или tcp")
+    try:
+        host, port = u.hostname, u.port
+    except ValueError as e:
+        raise Invalid(f"Некорректный адрес: {e}") from e
+    if not host:
+        raise Invalid("В адресе нет имени хоста")
+    if not host.isascii():
+        # Ровно та ошибка, которую даёт адрес-заглушка кириллицей: Tor такой
+        # хост не разберёт и ответит общим сбоем SOCKS.
+        raise Invalid("Имя хоста содержит не-ASCII символы — это не onion-адрес")
+    if host.endswith(".onion") and not ONION_V3.match(host):
+        raise Invalid("Это не похоже на onion-адрес v3: 56 символов a–z и 2–7, затем .onion. "
+                      "Проверьте адрес — ошибка в одном символе указывает на другой сервис")
+    if u.scheme == "tcp" and not port:
+        raise Invalid("Для tcp:// нужно указать порт, например tcp://адрес.onion:22")
+
+    mode = str(data.get("mode") or ("tcp" if u.scheme == "tcp" else "http"))
+    if mode not in ("http", "tcp"):
+        raise Invalid("Режим: http или tcp")
+
+    def opt_num(key: str, lo: float, hi: float) -> float | None:
+        v = data.get(key)
+        if v in (None, "", "auto"):
+            return None
+        try:
+            v = float(v)
+        except (TypeError, ValueError) as e:
+            raise Invalid(f"Поле {key}: нужно число") from e
+        if not lo <= v <= hi:
+            raise Invalid(f"Поле {key}: допустимо от {lo:g} до {hi:g}")
+        return v
+
+    interval = opt_num("interval", 30, 86400)
+    timeout = opt_num("timeout", 5, 600)
+
+    raw_status = data.get("expect_status") or [200]
+    if isinstance(raw_status, str):
+        raw_status = [p for p in re.split(r"[,\s]+", raw_status.strip()) if p]
+    try:
+        expect_status = sorted({int(s) for s in raw_status})
+    except (TypeError, ValueError) as e:
+        raise Invalid("Ожидаемые коды: числа через запятую, например 200, 301") from e
+    if not expect_status or any(not 100 <= s <= 599 for s in expect_status):
+        raise Invalid("Ожидаемые коды должны быть в диапазоне 100–599")
+
+    expect_text = (data.get("expect_text") or "").strip() or None
+    if expect_text and len(expect_text) > 200:
+        raise Invalid("Искомая строка слишком длинная (максимум 200 символов)")
+
+    note = (data.get("note") or "").strip()[:300]
+
+    row = {
+        "name": name, "url": url, "mode": mode,
+        "interval": int(interval) if interval else None,
+        "timeout": timeout,
+        "expect_status": json.dumps(expect_status),
+        "expect_text": expect_text, "note": note,
+        "enabled": 1 if data.get("enabled", True) else 0,
+    }
+    # Финальная проверка: цель должна собираться.
+    row_to_target(row | {"id": 0}, cfg)
+    return row
+
+
+def row_to_target(r: Any, cfg: Config) -> Target:
+    return Target(
+        name=r["name"],
+        url=r["url"],
+        interval=int(r["interval"] or cfg.interval),
+        timeout=float(r["timeout"] or cfg.timeout),
+        expect_status=json.loads(r["expect_status"] or "[200]"),
+        expect_text=r["expect_text"],
+        mode=r["mode"] or "http",
+        note=r["note"] or "",
+        id=int(r["id"] or 0),
+        enabled=bool(r["enabled"]),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -197,7 +303,7 @@ async def socks5_open(
         elif method != 0x00:
             raise ConnectionError("SOCKS-прокси не предложил поддерживаемый метод авторизации")
 
-        addr = host.encode("idna" if not host.isascii() else "ascii")
+        addr = host.encode("ascii")
         writer.write(b"\x05\x01\x00\x03" + bytes([len(addr)]) + addr + port.to_bytes(2, "big"))
         await writer.drain()
 
@@ -216,12 +322,10 @@ async def socks5_open(
         return reader, writer
     except BaseException:
         writer.close()
-        with_suppress = getattr(writer, "wait_closed", None)
-        if with_suppress:
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
         raise
 
 
@@ -342,9 +446,10 @@ async def check_target(cfg: Config, t: Target) -> dict[str, Any]:
 
 class Store:
     def __init__(self, path: str):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        self.targets_rev = 0     # растёт при любом изменении списка целей
         with self.lock:
             self.db.executescript(
                 """
@@ -363,9 +468,41 @@ class Store:
                     error TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_checks_target_ts ON checks(target, ts DESC);
+
+                CREATE TABLE IF NOT EXISTS targets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    url TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'http',
+                    interval INTEGER,
+                    timeout REAL,
+                    expect_status TEXT NOT NULL DEFAULT '[200]',
+                    expect_text TEXT,
+                    note TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS admins (
+                    login TEXT PRIMARY KEY,
+                    salt BLOB NOT NULL,
+                    hash BLOB NOT NULL,
+                    created_at REAL NOT NULL,
+                    last_login REAL
+                );
+
+                CREATE TABLE IF NOT EXISTS sessions (
+                    token_hash TEXT PRIMARY KEY,
+                    login TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                );
                 """
             )
             self.db.commit()
+
+    # -- проверки ----------------------------------------------------------
 
     def add(self, r: dict[str, Any]) -> None:
         with self.lock:
@@ -381,6 +518,7 @@ class Store:
         cutoff = time.time() - days * 86400
         with self.lock:
             cur = self.db.execute("DELETE FROM checks WHERE ts < ?", (cutoff,))
+            self.db.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
             self.db.commit()
             return cur.rowcount
 
@@ -409,6 +547,156 @@ class Store:
             "avg_circuit_ms": round(row["conn"], 0) if row["conn"] else None,
         }
 
+    # -- цели --------------------------------------------------------------
+
+    def list_targets(self, cfg: Config, enabled_only: bool = False) -> list[Target]:
+        q = "SELECT * FROM targets"
+        if enabled_only:
+            q += " WHERE enabled=1"
+        q += " ORDER BY id"
+        with self.lock:
+            rows = self.db.execute(q).fetchall()
+        out = []
+        for r in rows:
+            try:
+                out.append(row_to_target(r, cfg))
+            except ValueError as e:
+                print(f"! цель {r['name']!r} пропущена: {e}", file=sys.stderr, flush=True)
+        return out
+
+    def add_target(self, row: dict[str, Any]) -> int:
+        now = time.time()
+        with self.lock:
+            if self.db.execute("SELECT 1 FROM targets WHERE name=?", (row["name"],)).fetchone():
+                raise Invalid(f"Цель с именем {row['name']!r} уже есть")
+            cur = self.db.execute(
+                "INSERT INTO targets (name, url, mode, interval, timeout, expect_status,"
+                " expect_text, note, enabled, created_at, updated_at)"
+                " VALUES (:name,:url,:mode,:interval,:timeout,:expect_status,"
+                " :expect_text,:note,:enabled,:now,:now)", row | {"now": now})
+            self.db.commit()
+            self.targets_rev += 1
+            return int(cur.lastrowid)
+
+    def update_target(self, tid: int, row: dict[str, Any]) -> None:
+        with self.lock:
+            old = self.db.execute("SELECT * FROM targets WHERE id=?", (tid,)).fetchone()
+            if not old:
+                raise Invalid("Цель не найдена")
+            clash = self.db.execute(
+                "SELECT 1 FROM targets WHERE name=? AND id<>?", (row["name"], tid)).fetchone()
+            if clash:
+                raise Invalid(f"Цель с именем {row['name']!r} уже есть")
+            self.db.execute(
+                "UPDATE targets SET name=:name, url=:url, mode=:mode, interval=:interval,"
+                " timeout=:timeout, expect_status=:expect_status, expect_text=:expect_text,"
+                " note=:note, enabled=:enabled, updated_at=:now WHERE id=:id",
+                row | {"id": tid, "now": time.time()})
+            if old["name"] != row["name"]:
+                # История привязана к имени — переносим, иначе графики обнулятся.
+                self.db.execute("UPDATE checks SET target=? WHERE target=?",
+                                (row["name"], old["name"]))
+            self.db.commit()
+            self.targets_rev += 1
+
+    def delete_target(self, tid: int) -> str:
+        with self.lock:
+            row = self.db.execute("SELECT name FROM targets WHERE id=?", (tid,)).fetchone()
+            if not row:
+                raise Invalid("Цель не найдена")
+            self.db.execute("DELETE FROM targets WHERE id=?", (tid,))
+            self.db.execute("DELETE FROM checks WHERE target=?", (row["name"],))
+            self.db.commit()
+            self.targets_rev += 1
+            return row["name"]
+
+    def seed_targets(self, cfg: Config) -> int:
+        """Разовый импорт targets[] из конфига, пока таблица пуста."""
+        with self.lock:
+            if self.db.execute("SELECT 1 FROM targets LIMIT 1").fetchone():
+                return 0
+        added = 0
+        for item in cfg.seed_targets:
+            try:
+                self.add_target(clean_target(item, cfg))
+                added += 1
+            except Invalid as e:
+                print(f"! цель {item.get('name')!r} из конфига не импортирована: {e}",
+                      file=sys.stderr, flush=True)
+        return added
+
+    # -- администраторы и сессии ------------------------------------------
+
+    def admin_count(self) -> int:
+        with self.lock:
+            return int(self.db.execute("SELECT COUNT(*) c FROM admins").fetchone()["c"])
+
+    def set_admin(self, login: str, password: str) -> None:
+        login = login.strip()
+        if not 1 <= len(login) <= 64:
+            raise Invalid("Логин: от 1 до 64 символов")
+        if len(password) < 10:
+            raise Invalid("Пароль: минимум 10 символов")
+        salt = secrets.token_bytes(16)
+        digest = hashlib.scrypt(password.encode(), salt=salt, **SCRYPT)
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO admins (login, salt, hash, created_at) VALUES (?,?,?,?)"
+                " ON CONFLICT(login) DO UPDATE SET salt=excluded.salt, hash=excluded.hash",
+                (login, salt, digest, time.time()))
+            self.db.commit()
+
+    def check_password(self, login: str, password: str) -> bool:
+        with self.lock:
+            row = self.db.execute("SELECT * FROM admins WHERE login=?", (login,)).fetchone()
+        if not row:
+            # Считаем впустую, чтобы по времени ответа нельзя было перебирать логины.
+            hashlib.scrypt(password.encode(), salt=b"0" * 16, **SCRYPT)
+            return False
+        digest = hashlib.scrypt(password.encode(), salt=row["salt"], **SCRYPT)
+        if not hmac.compare_digest(digest, row["hash"]):
+            return False
+        with self.lock:
+            self.db.execute("UPDATE admins SET last_login=? WHERE login=?", (time.time(), login))
+            self.db.commit()
+        return True
+
+    def open_session(self, login: str, hours: int) -> str:
+        token = secrets.token_urlsafe(32)
+        now = time.time()
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO sessions (token_hash, login, created_at, expires_at) VALUES (?,?,?,?)",
+                (_token_hash(token), login, now, now + hours * 3600))
+            self.db.commit()
+        return token
+
+    def session_login(self, token: str) -> str | None:
+        if not token:
+            return None
+        with self.lock:
+            row = self.db.execute(
+                "SELECT login, expires_at FROM sessions WHERE token_hash=?",
+                (_token_hash(token),)).fetchone()
+        if not row or row["expires_at"] < time.time():
+            return None
+        return row["login"]
+
+    def close_session(self, token: str) -> None:
+        with self.lock:
+            self.db.execute("DELETE FROM sessions WHERE token_hash=?", (_token_hash(token),))
+            self.db.commit()
+
+    def close_all_sessions(self, login: str) -> None:
+        with self.lock:
+            self.db.execute("DELETE FROM sessions WHERE login=?", (login,))
+            self.db.commit()
+
+
+def _token_hash(token: str) -> str:
+    # В базе лежит только хэш: утечка файла не даёт живых сессий.
+    return hashlib.sha256(token.encode()).hexdigest()
+
 
 # --------------------------------------------------------------------------
 # Планировщик
@@ -423,6 +711,32 @@ class Monitor:
         self.last: dict[str, dict[str, Any]] = {}
         self.running: set[str] = set()
         self.started_at = time.time()
+        self.targets: dict[str, Target] = {}
+        self.due: dict[str, float] = {}
+        self._rev = -1
+
+    # -- список целей ------------------------------------------------------
+
+    def sync_targets(self, force: bool = False) -> None:
+        """Подхватывает изменения из админки без перезапуска демона."""
+        if not force and self._rev == self.store.targets_rev:
+            return
+        self._rev = self.store.targets_rev
+        fresh = {t.name: t for t in self.store.list_targets(self.cfg, enabled_only=True)}
+        now = time.time()
+        for name, t in fresh.items():
+            old = self.targets.get(name)
+            if old is None or old.url != t.url or old.mode != t.mode:
+                self.due[name] = now      # новая или переписанная цель — проверяем сразу
+            elif name not in self.due:
+                self.due[name] = now
+        for name in list(self.due):
+            if name not in fresh:
+                self.due.pop(name, None)
+                self.last.pop(name, None)
+        self.targets = fresh
+
+    # -- прогон ------------------------------------------------------------
 
     async def run_check(self, t: Target) -> dict[str, Any]:
         if t.name in self.running:
@@ -441,14 +755,11 @@ class Monitor:
               f"{res['total_ms']:>7.0f} ms  {detail}", flush=True)
         return res
 
-    async def _loop_target(self, t: Target) -> None:
-        await asyncio.sleep(random.uniform(0, min(20.0, t.interval)))
-        while True:
-            try:
-                await self.run_check(t)
-            except Exception as e:  # проверка не должна ронять планировщик
-                print(f"! ошибка планировщика для {t.name}: {e}", file=sys.stderr, flush=True)
-            await asyncio.sleep(t.interval * random.uniform(0.9, 1.1))
+    async def _guarded(self, t: Target) -> None:
+        try:
+            await self.run_check(t)
+        except Exception as e:  # проверка не должна ронять планировщик
+            print(f"! ошибка планировщика для {t.name}: {e}", file=sys.stderr, flush=True)
 
     async def _loop_prune(self) -> None:
         while True:
@@ -458,17 +769,31 @@ class Monitor:
                 print(f"[db] удалено старых записей: {removed}", flush=True)
 
     async def serve(self) -> None:
+        """Один цикл на все цели: список может меняться прямо во время работы."""
         self.loop = asyncio.get_running_loop()
-        tasks = [asyncio.create_task(self._loop_target(t)) for t in self.cfg.targets]
-        tasks.append(asyncio.create_task(self._loop_prune()))
-        await asyncio.gather(*tasks)
+        asyncio.create_task(self._loop_prune())
+        # Первый прогон разносим по времени, чтобы не бить в Tor всеми целями разом.
+        self.sync_targets(force=True)
+        spread = min(20.0, self.cfg.interval)
+        for name in self.due:
+            self.due[name] = time.time() + random.uniform(0, spread)
+        while True:
+            self.sync_targets()
+            now = time.time()
+            for name, t in list(self.targets.items()):
+                if name not in self.running and self.due.get(name, 0) <= now:
+                    self.due[name] = now + t.interval * random.uniform(0.9, 1.1)
+                    asyncio.create_task(self._guarded(t))
+            await asyncio.sleep(1)
 
     def request_check(self, name: str) -> bool:
         """Вызывается из потока HTTP-сервера."""
-        t = next((x for x in self.cfg.targets if x.name == name), None)
+        self.sync_targets()
+        t = self.targets.get(name)
         if not t or self.loop is None:
             return False
-        asyncio.run_coroutine_threadsafe(self.run_check(t), self.loop)
+        self.due[name] = time.time() + t.interval
+        asyncio.run_coroutine_threadsafe(self._guarded(t), self.loop)
         return True
 
     def tor_alive(self) -> bool:
@@ -481,13 +806,15 @@ class Monitor:
             return False
 
     def state(self) -> dict[str, Any]:
+        self.sync_targets()
         out = []
-        for t in self.cfg.targets:
+        for t in self.targets.values():
             last = self.last.get(t.name)
             if last is None:
                 rows = self.store.history(t.name, 1)
                 last = rows[-1] if rows else None
             out.append({
+                "id": t.id,
                 "name": t.name,
                 "url": t.url,
                 "host": t.host,
@@ -503,12 +830,15 @@ class Monitor:
                 "history": self.store.history(t.name, 60),
             })
         up = sum(1 for x in out if x["last"] and x["last"].get("ok"))
+        pending = sum(1 for x in out if not x["last"])
         return {
             "generated_at": time.time(),
             "started_at": self.started_at,
             "tor_ok": self.tor_alive(),
             "tor_socks": f"{self.cfg.tor_socks[0]}:{self.cfg.tor_socks[1]}",
             "up": up,
+            "down": len(out) - up - pending,
+            "pending": pending,
             "total": len(out),
             "targets": out,
         }
@@ -518,7 +848,40 @@ class Monitor:
 # HTTP-интерфейс
 # --------------------------------------------------------------------------
 
+COOKIE = "ow_session"
+
+
+class LoginGuard:
+    """Тормозит перебор пароля: счётчик неудач на IP."""
+
+    LIMIT, WINDOW, PENALTY = 8, 900.0, 1.0
+
+    def __init__(self) -> None:
+        self.fails: dict[str, list[float]] = {}
+        self.lock = threading.Lock()
+
+    def blocked(self, ip: str) -> float:
+        with self.lock:
+            hits = [t for t in self.fails.get(ip, []) if t > time.time() - self.WINDOW]
+            self.fails[ip] = hits
+            if len(hits) < self.LIMIT:
+                return 0.0
+            return self.WINDOW - (time.time() - hits[0])
+
+    def fail(self, ip: str) -> None:
+        with self.lock:
+            self.fails.setdefault(ip, []).append(time.time())
+
+    def reset(self, ip: str) -> None:
+        with self.lock:
+            self.fails.pop(ip, None)
+
+
 def make_handler(monitor: Monitor):
+    store = monitor.store
+    cfg = monitor.cfg
+    guard = LoginGuard()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = UA
         protocol_version = "HTTP/1.1"
@@ -526,46 +889,245 @@ def make_handler(monitor: Monitor):
         def log_message(self, *args):  # тихий лог
             pass
 
-        def _send(self, code: int, body: bytes, ctype: str) -> None:
+        # -- примитивы ----------------------------------------------------
+
+        def _send(self, code: int, body: bytes, ctype: str, cookie: str | None = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; img-src 'self' data:; "
+                             "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+                             "connect-src 'self'; form-action 'none'; frame-ancestors 'none'")
+            if cookie:
+                self.send_header("Set-Cookie", cookie)
             self.end_headers()
-            self.wfile.write(body)
+            if self.command != "HEAD":
+                self.wfile.write(body)
 
-        def _json(self, code: int, payload: Any) -> None:
+        def _json(self, code: int, payload: Any, cookie: str | None = None) -> None:
             self._send(code, json.dumps(payload, ensure_ascii=False).encode(),
-                       "application/json; charset=utf-8")
+                       "application/json; charset=utf-8", cookie)
+
+        def _page(self, filename: str) -> None:
+            try:
+                with open(os.path.join(HERE, filename), "rb") as fh:
+                    self._send(200, fh.read(), "text/html; charset=utf-8")
+            except FileNotFoundError:
+                self._send(404, f"{filename} not found next to onionwatch.py".encode(),
+                           "text/plain; charset=utf-8")
+
+        def _body(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0:
+                return {}
+            if length > MAX_BODY:
+                raise Invalid("Слишком большой запрос")
+            try:
+                data = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                raise Invalid(f"Тело запроса не разобрано как JSON: {e}") from e
+            if not isinstance(data, dict):
+                raise Invalid("Ожидался JSON-объект")
+            return data
+
+        # -- сессия -------------------------------------------------------
+
+        def _token(self) -> str:
+            raw = self.headers.get("Cookie")
+            if not raw:
+                return ""
+            try:
+                jar = http.cookies.SimpleCookie(raw)
+            except http.cookies.CookieError:
+                return ""
+            morsel = jar.get(COOKIE)
+            return morsel.value if morsel else ""
+
+        def _login(self) -> str | None:
+            return store.session_login(self._token())
+
+        def _secure(self) -> bool:
+            return self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+        def _cookie(self, token: str | None) -> str:
+            parts = [f"{COOKIE}={token or ''}", "Path=/", "HttpOnly", "SameSite=Strict"]
+            if self._secure():
+                parts.append("Secure")
+            parts.append(f"Max-Age={cfg.session_hours * 3600}" if token else "Max-Age=0")
+            return "; ".join(parts)
+
+        def _require_admin(self) -> str | None:
+            """Логин или None; при None ответ клиенту уже отправлен."""
+            login = self._login()
+            if not login:
+                self._json(401, {"error": "Нужен вход в админку"})
+                return None
+            # Заголовок нельзя выставить кросс-сайтовой формой — это защита от CSRF
+            # в дополнение к SameSite=Strict.
+            if self.headers.get("X-Requested-With") != "onionwatch":
+                self._json(403, {"error": "Запрос без метки X-Requested-With отклонён"})
+                return None
+            return login
+
+        def _public_ok(self) -> bool:
+            """Пускать ли на дашборд без входа."""
+            return not cfg.require_login or bool(self._login())
+
+        def _client_ip(self) -> str:
+            fwd = self.headers.get("X-Forwarded-For", "")
+            return fwd.split(",")[0].strip() or self.client_address[0]
+
+        # -- маршруты -----------------------------------------------------
 
         def do_GET(self):
             path = urllib.parse.urlsplit(self.path).path
-            if path in ("/", "/index.html"):
-                try:
-                    with open(os.path.join(HERE, "dashboard.html"), "rb") as fh:
-                        self._send(200, fh.read(), "text/html; charset=utf-8")
-                except FileNotFoundError:
-                    self._send(404, b"dashboard.html not found next to onionwatch.py",
-                               "text/plain; charset=utf-8")
-            elif path == "/api/state":
-                self._json(200, monitor.state())
-            elif path.startswith("/api/targets/") and path.endswith("/history"):
-                name = urllib.parse.unquote(path.split("/")[3])
-                self._json(200, {"target": name, "history": monitor.store.history(name, 500)})
-            else:
-                self._json(404, {"error": "Такого маршрута нет"})
+            try:
+                if path in ("/", "/index.html"):
+                    if not self._public_ok():
+                        return self._page("admin.html")
+                    return self._page("dashboard.html")
+                if path in ("/admin", "/admin.html"):
+                    return self._page("admin.html")
+
+                if path == "/api/session":
+                    login = self._login()
+                    return self._json(200, {
+                        "authed": bool(login),
+                        "login": login,
+                        "has_admin": store.admin_count() > 0,
+                        "require_login": cfg.require_login,
+                    })
+
+                if path == "/api/state":
+                    if not self._public_ok():
+                        return self._json(401, {"error": "Нужен вход"})
+                    return self._json(200, monitor.state())
+
+                if path.startswith("/api/targets/") and path.endswith("/history"):
+                    if not self._public_ok():
+                        return self._json(401, {"error": "Нужен вход"})
+                    name = urllib.parse.unquote(path.split("/")[3])
+                    return self._json(200, {"target": name,
+                                            "history": store.history(name, 500)})
+
+                if path == "/api/admin/targets":
+                    if not self._require_admin():
+                        return None
+                    rows = [{
+                        "id": t.id, "name": t.name, "url": t.url, "mode": t.mode,
+                        "interval": t.interval, "timeout": t.timeout,
+                        "expect_status": t.expect_status, "expect_text": t.expect_text,
+                        "note": t.note, "enabled": t.enabled,
+                    } for t in store.list_targets(cfg)]
+                    return self._json(200, {"targets": rows,
+                                            "defaults": {"interval": cfg.interval,
+                                                         "timeout": cfg.timeout}})
+
+                return self._json(404, {"error": "Такого маршрута нет"})
+            except Invalid as e:
+                return self._json(400, {"error": str(e)})
+
+        def do_HEAD(self):
+            self.do_GET()
 
         def do_POST(self):
             path = urllib.parse.urlsplit(self.path).path
-            if path.startswith("/api/targets/") and path.endswith("/check"):
-                name = urllib.parse.unquote(path.split("/")[3])
-                if monitor.request_check(name):
-                    self._json(202, {"queued": name})
-                else:
-                    self._json(404, {"error": f"Цель {name} не найдена"})
-            else:
-                self._json(404, {"error": "Такого маршрута нет"})
+            try:
+                if path == "/api/login":
+                    return self._login_route()
+                if path == "/api/logout":
+                    token = self._token()
+                    if token:
+                        store.close_session(token)
+                    return self._json(200, {"ok": True}, self._cookie(None))
+
+                if path.startswith("/api/targets/") and path.endswith("/check"):
+                    if not self._public_ok():
+                        return self._json(401, {"error": "Нужен вход"})
+                    name = urllib.parse.unquote(path.split("/")[3])
+                    if monitor.request_check(name):
+                        return self._json(202, {"queued": name})
+                    return self._json(404, {"error": f"Цель {name} не найдена"})
+
+                if path == "/api/admin/targets":
+                    if not self._require_admin():
+                        return None
+                    row = clean_target(self._body(), cfg)
+                    tid = store.add_target(row)
+                    monitor.sync_targets()
+                    return self._json(201, {"id": tid})
+
+                if path == "/api/admin/password":
+                    login = self._require_admin()
+                    if not login:
+                        return None
+                    data = self._body()
+                    if not store.check_password(login, str(data.get("current", ""))):
+                        return self._json(403, {"error": "Текущий пароль неверен"})
+                    store.set_admin(login, str(data.get("password", "")))
+                    store.close_all_sessions(login)   # переподключиться придётся везде
+                    return self._json(200, {"ok": True}, self._cookie(None))
+
+                return self._json(404, {"error": "Такого маршрута нет"})
+            except Invalid as e:
+                return self._json(400, {"error": str(e)})
+
+        def do_PUT(self):
+            path = urllib.parse.urlsplit(self.path).path
+            try:
+                if path.startswith("/api/admin/targets/"):
+                    if not self._require_admin():
+                        return None
+                    tid = self._target_id(path)
+                    store.update_target(tid, clean_target(self._body(), cfg))
+                    monitor.sync_targets()
+                    return self._json(200, {"ok": True})
+                return self._json(404, {"error": "Такого маршрута нет"})
+            except Invalid as e:
+                return self._json(400, {"error": str(e)})
+
+        def do_DELETE(self):
+            path = urllib.parse.urlsplit(self.path).path
+            try:
+                if path.startswith("/api/admin/targets/"):
+                    if not self._require_admin():
+                        return None
+                    name = store.delete_target(self._target_id(path))
+                    monitor.sync_targets()
+                    return self._json(200, {"deleted": name})
+                return self._json(404, {"error": "Такого маршрута нет"})
+            except Invalid as e:
+                return self._json(400, {"error": str(e)})
+
+        def _target_id(self, path: str) -> int:
+            try:
+                return int(path.rsplit("/", 1)[1])
+            except (IndexError, ValueError) as e:
+                raise Invalid("Не разобран идентификатор цели") from e
+
+        def _login_route(self) -> None:
+            ip = self._client_ip()
+            wait = guard.blocked(ip)
+            if wait > 0:
+                return self._json(429, {"error": f"Слишком много попыток. "
+                                                 f"Подождите {int(wait / 60) + 1} мин"})
+            data = self._body()
+            login = str(data.get("login", "")).strip()
+            password = str(data.get("password", ""))
+            if not login or not password:
+                return self._json(400, {"error": "Введите логин и пароль"})
+            if not store.check_password(login, password):
+                guard.fail(ip)
+                time.sleep(LoginGuard.PENALTY)
+                return self._json(401, {"error": "Неверный логин или пароль"})
+            guard.reset(ip)
+            token = store.open_session(login, cfg.session_hours)
+            return self._json(200, {"ok": True, "login": login}, self._cookie(token))
 
     return Handler
 
@@ -577,7 +1139,12 @@ def make_handler(monitor: Monitor):
 async def run_once(cfg: Config, store: Store) -> int:
     monitor = Monitor(cfg, store)
     monitor.loop = asyncio.get_running_loop()
-    results = await asyncio.gather(*(monitor.run_check(t) for t in cfg.targets))
+    monitor.sync_targets(force=True)
+    targets = list(monitor.targets.values())
+    if not targets:
+        print("В базе нет ни одной включённой цели — заведите их в админке.", file=sys.stderr)
+        return 2
+    results = await asyncio.gather(*(monitor.run_check(t) for t in targets))
     down = [r for r in results if not r["ok"]]
     print(f"\nДоступно {len(results) - len(down)} из {len(results)}")
     for r in down:
@@ -585,11 +1152,29 @@ async def run_once(cfg: Config, store: Store) -> int:
     return 1 if down else 0
 
 
+def set_admin_interactive(store: Store, login: str) -> int:
+    print(f"Пароль для администратора {login!r} (минимум 10 символов).")
+    password = getpass.getpass("Пароль: ")
+    if password != getpass.getpass("Ещё раз: "):
+        print("Пароли не совпали.", file=sys.stderr)
+        return 2
+    try:
+        store.set_admin(login, password)
+    except Invalid as e:
+        print(f"{e}", file=sys.stderr)
+        return 2
+    store.close_all_sessions(login)
+    print(f"Готово. Вход в админку: /admin, логин {login!r}.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Монитор доступности onion-сервисов")
     ap.add_argument("--config", default=os.path.join(HERE, "config.json"))
     ap.add_argument("--once", action="store_true", help="один прогон и выход (для cron/CI)")
     ap.add_argument("--no-web", action="store_true", help="только проверки, без дашборда")
+    ap.add_argument("--set-admin", metavar="ЛОГИН",
+                    help="создать администратора или сменить ему пароль и выйти")
     args = ap.parse_args()
 
     try:
@@ -600,6 +1185,14 @@ def main() -> int:
 
     store = Store(cfg.db_path)
 
+    if args.set_admin:
+        return set_admin_interactive(store, args.set_admin)
+
+    imported = store.seed_targets(cfg)
+    if imported:
+        print(f"Из конфига импортировано целей: {imported}. "
+              f"Дальше правьте их в админке — в конфиге они больше не нужны.", flush=True)
+
     if args.once:
         return asyncio.run(run_once(cfg, store))
 
@@ -607,12 +1200,16 @@ def main() -> int:
     if not monitor.tor_alive():
         print(f"Внимание: SOCKS-порт Tor {cfg.tor_socks[0]}:{cfg.tor_socks[1]} не отвечает. "
               f"Запустите tor или поправьте tor_socks в конфиге.", file=sys.stderr)
+    if store.admin_count() == 0:
+        print(f"Администратора ещё нет. Создайте его:\n"
+              f"  python3 {os.path.basename(__file__)} --config {args.config} --set-admin admin",
+              file=sys.stderr, flush=True)
 
     if not args.no_web:
         httpd = ThreadingHTTPServer(cfg.listen, make_handler(monitor))
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         print(f"Дашборд: http://{cfg.listen[0]}:{cfg.listen[1]}/  "
-              f"(целей: {len(cfg.targets)}, база: {cfg.db_path})", flush=True)
+              f"(админка /admin, база: {cfg.db_path})", flush=True)
 
     try:
         asyncio.run(monitor.serve())

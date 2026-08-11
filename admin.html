@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>onionwatch — админка</title>
+<style>
+  :root {
+    --ink: #0f1220; --panel: #161a2c; --panel-2: #1c2138; --line: #272d4a;
+    --text: #e7e9f5; --muted: #949bc4; --dim: #5d6390;
+    --up: #3ecfa0; --down: #ff5d73; --circuit: #8f7bff;
+    --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ink); color: var(--text); font-family: var(--sans);
+    font-size: 15px; line-height: 1.5;
+    background-image: radial-gradient(circle at 15% -10%, #1d2244 0%, transparent 55%);
+    background-attachment: fixed;
+  }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 64px; }
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--dim); }
+  h1 { font-size: 24px; margin: 4px 0 0; font-weight: 620; }
+  h1 span { color: var(--circuit); }
+  h2 { font-size: 15px; margin: 0 0 14px; font-weight: 600; }
+  header.top { display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-end;
+    justify-content: space-between; border-bottom: 1px solid var(--line); padding-bottom: 18px; }
+  .meta { font-family: var(--mono); font-size: 12px; color: var(--muted);
+    display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  a { color: var(--circuit); }
+
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px; margin-top: 18px; }
+  label { display: block; font-family: var(--mono); font-size: 10px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--dim); margin-bottom: 5px; }
+  input, select, .btn, button {
+    font: inherit; font-size: 14px; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; width: 100%;
+  }
+  input::placeholder { color: var(--dim); }
+  .btn, button { cursor: pointer; width: auto; text-decoration: none; display: inline-block; }
+  .btn:hover, button:hover { border-color: #3a4270; }
+  button.primary { background: var(--circuit); border-color: var(--circuit); color: #12132a;
+    font-weight: 600; }
+  button.danger { color: var(--down); }
+  button:disabled { opacity: .5; cursor: default; }
+  :focus-visible { outline: 2px solid var(--circuit); outline-offset: 2px; }
+
+  .fields { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+  .fields .wide { grid-column: 1 / -1; }
+  .hint { font-size: 12px; color: var(--dim); margin-top: 5px; }
+  .actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+  .check { display: flex; align-items: center; gap: 8px; }
+  .check input { width: auto; }
+  .check label { margin: 0; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; font-family: var(--mono); font-size: 10px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--dim); font-weight: 400;
+    border-bottom: 1px solid var(--line); padding: 0 10px 8px 0; }
+  td { padding: 11px 10px 11px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  .t-name { font-weight: 600; }
+  .t-url { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+    word-break: break-all; }
+  /* Параметры проверки ломать по символам нельзя — «60 с» уезжает на две строки. */
+  td.spec { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
+    white-space: nowrap; width: 1%; }
+  .tag { font-family: var(--mono); font-size: 10px; letter-spacing: .08em;
+    text-transform: uppercase; padding: 2px 6px; border-radius: 4px;
+    border: 1px solid currentColor; }
+  .tag.on { color: var(--up); } .tag.off { color: var(--dim); }
+  td.act { text-align: right; white-space: nowrap; }
+  td.act button { padding: 5px 9px; font-size: 12px; margin-left: 6px; }
+
+  .msg { border-radius: 8px; padding: 10px 14px; margin-top: 14px; font-size: 14px; }
+  .msg.err { border: 1px solid var(--down); background: rgba(255,93,115,.09); }
+  .msg.ok { border: 1px solid var(--up); background: rgba(62,207,160,.09); }
+  .login { max-width: 380px; margin: 60px auto 0; }
+  .login .panel > * + * { margin-top: 14px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div>
+      <div class="eyebrow">Управление целями</div>
+      <h1>onion<span>watch</span> — админка</h1>
+    </div>
+    <div class="meta" id="meta"></div>
+  </header>
+
+  <!-- Вход -->
+  <section id="login-view" class="login hidden">
+    <div class="panel">
+      <h2>Вход</h2>
+      <div>
+        <label for="l-login">Логин</label>
+        <input id="l-login" autocomplete="username" autocapitalize="off" spellcheck="false">
+      </div>
+      <div>
+        <label for="l-pass">Пароль</label>
+        <input id="l-pass" type="password" autocomplete="current-password">
+      </div>
+      <div class="actions">
+        <button class="primary" id="l-go">Войти</button>
+      </div>
+      <div id="l-msg"></div>
+      <div class="hint" id="l-hint"></div>
+    </div>
+  </section>
+
+  <!-- Рабочая часть -->
+  <section id="admin-view" class="hidden">
+
+    <div class="panel">
+      <h2 id="form-title">Новая цель</h2>
+      <div class="fields">
+        <div class="wide">
+          <label for="f-url">Адрес onion-сервиса</label>
+          <input id="f-url" placeholder="http://xxxxxxxx…xxxx.onion/" autocapitalize="off" spellcheck="false">
+          <div class="hint">v3-адрес: 56 символов a–z и 2–7, затем .onion.
+            Берите его из официального источника сервиса и копируйте целиком —
+            ошибка в одном символе указывает на другой сервис.</div>
+        </div>
+        <div>
+          <label for="f-name">Имя</label>
+          <input id="f-name" placeholder="my-blog" autocapitalize="off">
+        </div>
+        <div>
+          <label for="f-mode">Режим</label>
+          <select id="f-mode">
+            <option value="http">http — запрос и проверка ответа</option>
+            <option value="tcp">tcp — только открытие потока</option>
+          </select>
+        </div>
+        <div>
+          <label for="f-interval">Интервал, с</label>
+          <input id="f-interval" inputmode="numeric" placeholder="по умолчанию">
+        </div>
+        <div>
+          <label for="f-timeout">Таймаут, с</label>
+          <input id="f-timeout" inputmode="numeric" placeholder="по умолчанию">
+        </div>
+        <div>
+          <label for="f-status">Ожидаемые коды</label>
+          <input id="f-status" placeholder="200, 301">
+        </div>
+        <div>
+          <label for="f-text">Строка в ответе</label>
+          <input id="f-text" placeholder="необязательно">
+        </div>
+        <div class="wide">
+          <label for="f-note">Заметка</label>
+          <input id="f-note" placeholder="видна на карточке дашборда">
+        </div>
+      </div>
+      <div class="actions">
+        <div class="check">
+          <input type="checkbox" id="f-enabled" checked>
+          <label for="f-enabled">Проверять</label>
+        </div>
+        <button class="primary" id="f-save">Добавить</button>
+        <button id="f-cancel" class="hidden">Отмена</button>
+      </div>
+      <div id="f-msg"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Цели</h2>
+      <div id="targets"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Смена пароля</h2>
+      <div class="fields">
+        <div>
+          <label for="p-cur">Текущий пароль</label>
+          <input id="p-cur" type="password" autocomplete="current-password">
+        </div>
+        <div>
+          <label for="p-new">Новый пароль</label>
+          <input id="p-new" type="password" autocomplete="new-password">
+        </div>
+      </div>
+      <div class="actions">
+        <button id="p-go">Сменить</button>
+      </div>
+      <div class="hint">Минимум 10 символов. После смены все сессии закрываются
+        и потребуется войти заново.</div>
+      <div id="p-msg"></div>
+    </div>
+
+  </section>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let editing = null, defaults = { interval: 300, timeout: 60 };
+
+function say(node, text, kind) {
+  el(node).innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : "";
+}
+
+// Заголовок X-Requested-With кросс-сайтовая форма выставить не может —
+// вместе с SameSite=Strict это и есть защита от CSRF.
+async function api(method, url, body) {
+  const r = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json", "X-Requested-With": "onionwatch" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    cache: "no-store",
+  });
+  let data = {};
+  try { data = await r.json(); } catch (e) { /* пустой ответ — не беда */ }
+  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  return data;
+}
+
+function show(authed) {
+  el("login-view").classList.toggle("hidden", authed);
+  el("admin-view").classList.toggle("hidden", !authed);
+}
+
+async function boot() {
+  const s = await (await fetch("/api/session", { cache: "no-store" })).json();
+  el("meta").innerHTML = s.authed
+    ? `<span>вход выполнен: <b>${esc(s.login)}</b></span>`
+      + `<a href="/">← дашборд</a> <button id="logout">Выйти</button>`
+    : `<a href="/">← дашборд</a>`;
+  if (s.authed) el("logout").addEventListener("click", async () => {
+    await api("POST", "/api/logout"); location.reload();
+  });
+  el("l-hint").textContent = s.has_admin ? ""
+    : "Администратор ещё не создан. Выполните на сервере: "
+      + "python3 onionwatch.py --config <конфиг> --set-admin admin";
+  show(s.authed);
+  if (s.authed) loadTargets();
+}
+
+// -- вход ------------------------------------------------------------------
+
+async function doLogin() {
+  say("l-msg", "", "");
+  el("l-go").disabled = true;
+  try {
+    await api("POST", "/api/login",
+              { login: el("l-login").value, password: el("l-pass").value });
+    location.reload();
+  } catch (e) {
+    say("l-msg", e.message, "err");
+    el("l-pass").value = "";
+    el("l-go").disabled = false;
+  }
+}
+el("l-go").addEventListener("click", doLogin);
+for (const id of ["l-login", "l-pass"]) {
+  el(id).addEventListener("keydown", ev => { if (ev.key === "Enter") doLogin(); });
+}
+
+// -- список целей ----------------------------------------------------------
+
+function targetRow(t) {
+  return `<tr>
+    <td>
+      <div class="t-name">${esc(t.name)}</div>
+      <div class="t-url">${esc(t.url)}</div>
+      ${t.note ? `<div class="t-url">${esc(t.note)}</div>` : ""}
+    </td>
+    <td><span class="tag ${t.enabled ? "on" : "off"}">${t.enabled ? "проверяется" : "выключена"}</span></td>
+    <td class="spec">${esc(t.mode)} · ${Math.round(t.interval/60)} мин · ${Math.round(t.timeout)} с<br>
+        ${t.mode === "http" ? esc(t.expect_status.join(", ")) : "поток"}${t.expect_text ? " · «" + esc(t.expect_text) + "»" : ""}</td>
+    <td class="act">
+      <button data-edit="${t.id}">Изменить</button>
+      <button class="danger" data-del="${t.id}" data-name="${esc(t.name)}">Удалить</button>
+    </td>
+  </tr>`;
+}
+
+async function loadTargets() {
+  try {
+    const data = await api("GET", "/api/admin/targets");
+    defaults = data.defaults;
+    el("f-interval").placeholder = `по умолчанию ${defaults.interval}`;
+    el("f-timeout").placeholder = `по умолчанию ${Math.round(defaults.timeout)}`;
+    window.__targets = data.targets;
+    el("targets").innerHTML = data.targets.length
+      ? `<table><thead><tr><th>Цель</th><th>Статус</th><th>Проверка</th><th></th></tr></thead>
+         <tbody>${data.targets.map(targetRow).join("")}</tbody></table>`
+      : `<div class="hint">Целей пока нет. Добавьте первую в форме выше —
+         она попадёт на дашборд и будет проверена сразу.</div>`;
+  } catch (e) {
+    if (/401|вход/i.test(e.message)) return show(false);
+    el("targets").innerHTML = `<div class="msg err">${esc(e.message)}</div>`;
+  }
+}
+
+// -- форма -----------------------------------------------------------------
+
+function fillForm(t) {
+  editing = t ? t.id : null;
+  el("f-url").value = t ? t.url : "";
+  el("f-name").value = t ? t.name : "";
+  el("f-mode").value = t ? t.mode : "http";
+  el("f-interval").value = t && t.interval !== defaults.interval ? t.interval : "";
+  el("f-timeout").value = t && t.timeout !== defaults.timeout ? t.timeout : "";
+  el("f-status").value = t ? t.expect_status.join(", ") : "";
+  el("f-text").value = t ? (t.expect_text || "") : "";
+  el("f-note").value = t ? t.note : "";
+  el("f-enabled").checked = t ? t.enabled : true;
+  el("form-title").textContent = t ? `Цель «${t.name}»` : "Новая цель";
+  el("f-save").textContent = t ? "Сохранить" : "Добавить";
+  el("f-cancel").classList.toggle("hidden", !t);
+  say("f-msg", "", "");
+  if (t) el("f-url").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function formData() {
+  return {
+    name: el("f-name").value.trim() || el("f-url").value.trim(),
+    url: el("f-url").value.trim(),
+    mode: el("f-mode").value,
+    interval: el("f-interval").value.trim(),
+    timeout: el("f-timeout").value.trim(),
+    expect_status: el("f-status").value.trim() || "200",
+    expect_text: el("f-text").value.trim(),
+    note: el("f-note").value.trim(),
+    enabled: el("f-enabled").checked,
+  };
+}
+
+el("f-save").addEventListener("click", async () => {
+  el("f-save").disabled = true;
+  try {
+    if (editing) await api("PUT", "/api/admin/targets/" + editing, formData());
+    else await api("POST", "/api/admin/targets", formData());
+    fillForm(null);
+    say("f-msg", editing ? "Сохранено." : "Цель добавлена — первая проверка уже в очереди.", "ok");
+    loadTargets();
+  } catch (e) {
+    say("f-msg", e.message, "err");
+  } finally {
+    el("f-save").disabled = false;
+  }
+});
+el("f-cancel").addEventListener("click", () => fillForm(null));
+
+el("targets").addEventListener("click", async ev => {
+  const edit = ev.target.closest("[data-edit]");
+  if (edit) {
+    const t = (window.__targets || []).find(x => x.id === Number(edit.dataset.edit));
+    if (t) fillForm(t);
+    return;
+  }
+  const del = ev.target.closest("[data-del]");
+  if (!del) return;
+  if (!confirm(`Удалить цель «${del.dataset.name}» вместе со всей её историей проверок?`)) return;
+  try {
+    await api("DELETE", "/api/admin/targets/" + del.dataset.del);
+    if (editing === Number(del.dataset.del)) fillForm(null);
+    loadTargets();
+  } catch (e) {
+    say("f-msg", e.message, "err");
+  }
+});
+
+// -- пароль ----------------------------------------------------------------
+
+el("p-go").addEventListener("click", async () => {
+  say("p-msg", "", "");
+  try {
+    await api("POST", "/api/admin/password",
+              { current: el("p-cur").value, password: el("p-new").value });
+    say("p-msg", "Пароль изменён. Сейчас потребуется войти заново.", "ok");
+    setTimeout(() => location.reload(), 1500);
+  } catch (e) {
+    say("p-msg", e.message, "err");
+  }
+});
+
+boot();
+</script>
+</body>
+</html>

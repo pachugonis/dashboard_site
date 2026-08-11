@@ -13,9 +13,9 @@
 
 | Путь | Что там |
 |---|---|
-| `/opt/onionwatch/` | код: `onionwatch.py`, `dashboard.html` (только чтение) |
-| `/etc/onionwatch/config.json` | конфиг с целями, `0640 root:onionwatch` |
-| `/var/lib/onionwatch/onionwatch.db` | история проверок (SQLite) |
+| `/opt/onionwatch/` | код: `onionwatch.py`, `dashboard.html`, `admin.html` (только чтение) |
+| `/etc/onionwatch/config.json` | конфиг: порты и таймауты, `0640 root:onionwatch` |
+| `/var/lib/onionwatch/onionwatch.db` | цели, история проверок, администраторы (SQLite) |
 | `/etc/systemd/system/onionwatch.service` | юнит автозапуска |
 | `/etc/tor/torrc` | настройки Tor |
 
@@ -137,15 +137,20 @@ curl -s --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip
 # {"IsTor":true,"IP":"..."}
 ```
 
-Штатный конфиг менять не нужно: `SocksPort 9050` на `127.0.0.1` и изоляция
-цепочек по SOCKS-авторизации включены по умолчанию. Если хочется задать явно,
-допишите в `/etc/tor/torrc`:
+Одну строку в `/etc/tor/torrc` дописать всё же стоит:
 
 ```
-SocksPort 127.0.0.1:9050 IsolateSOCKSAuth
+SocksPort 127.0.0.1:9050 IsolateSOCKSAuth ExtendedErrors
 ```
 
-и выполните `sudo systemctl reload tor@default`.
+и выполнить `sudo systemctl reload tor@default`.
+
+`SocksPort 9050` на `127.0.0.1` и изоляция цепочек включены и по умолчанию, а вот
+`ExtendedErrors` — нет, и без него Tor не сообщает причину отказа: все сбои
+приходят одним кодом и попадают в лог как `general_failure`. С этим флагом
+onionwatch отличает выключенный сервис (`descriptor_not_found`) от недостроенной
+цепочки (`rendezvous_failed`) и от запроса клиентского ключа
+(`client_auth_missing`).
 
 ---
 
@@ -158,7 +163,7 @@ Python в Ubuntu 24.04 — 3.12, этого достаточно; ставить
 Скопируйте файлы на сервер с локальной машины:
 
 ```bash
-scp onionwatch.py dashboard.html config.example.json onionwatch.service \
+scp onionwatch.py dashboard.html admin.html config.example.json onionwatch.service \
     install.sh README.md admin@<IP-сервера>:~/onionwatch/
 ```
 
@@ -234,7 +239,8 @@ systemd-analyze security onionwatch.service | tail -5
 sudo nano /etc/onionwatch/config.json
 ```
 
-Минимально нужно поменять две вещи — путь к базе и адреса целей:
+Адресов сервисов в конфиге нет — они заводятся в админке и хранятся в базе.
+Здесь задаются только порты, интервалы и таймауты:
 
 ```json
 {
@@ -248,25 +254,43 @@ sudo nano /etc/onionwatch/config.json
   "retention_days": 30,
   "isolate_circuits": true,
 
-  "targets": [
-    {
-      "name": "my-blog",
-      "url": "http://ваш-адрес.onion/",
-      "expect_status": [200],
-      "expect_text": "<title>",
-      "note": "основной сайт"
-    }
-  ]
+  "require_login": false,
+  "session_hours": 12
 }
 ```
 
 `db_path` обязательно должен указывать на `/var/lib/onionwatch/` — в остальные
 каталоги сервису писать запрещено. Описание всех полей — в `README.md`.
 
-Адреса берите из официального источника сервиса и вставляйте копированием:
-ошибка в одном символе onion-адреса даёт совершенно другой сервис.
+Поставьте `"require_login": true`, если дашборд будет виден кому-то кроме вас:
+тогда логин спросят не только в админке, но и на главной странице.
 
-Проверьте конфиг разовым прогоном ещё до запуска демона:
+### Администратор
+
+Без администратора в админку не войти, а значит и цели добавить некому.
+`install.sh` предлагает создать его сам; вручную это делается так:
+
+```bash
+sudo -u onionwatch python3 /opt/onionwatch/onionwatch.py \
+     --config /etc/onionwatch/config.json --set-admin admin
+```
+
+Пароль спрашивается дважды и не остаётся ни в логах, ни в истории команд.
+Той же командой меняется забытый пароль. Минимальная длина — 10 символов;
+хранится scrypt-хэш со случайной солью.
+
+### Цели
+
+Откройте `/admin` (как достучаться до порта — раздел 6), войдите и добавьте
+адреса. Первая проверка новой цели ставится в очередь сразу, перезапускать
+демон не нужно.
+
+Адреса берите из официального источника сервиса и вставляйте копированием:
+ошибка в одном символе onion-адреса даёт совершенно другой сервис. Форма
+проверяет длину и алфавит v3-адреса, но подменённый на другой корректный адрес
+она отличить не может.
+
+Проверить всё разом можно разовым прогоном:
 
 ```bash
 sudo -u onionwatch python3 /opt/onionwatch/onionwatch.py \
@@ -497,19 +521,20 @@ journalctl -u tor@default --since today  # проблемы самой сети 
 
 **Изменение целей**
 
-```bash
-sudo nano /etc/onionwatch/config.json
-sudo systemctl restart onionwatch        # конфиг читается при старте
-```
+Через админку на `/admin` — перезапускать сервис не нужно, демон подхватывает
+изменения в течение секунды. Выключенная галочкой цель перестаёт проверяться,
+но сохраняет историю; удаление цели удаляет и её историю.
 
-История уже удалённых целей остаётся в базе и просто перестаёт показываться.
+Правка конфига (`sudo nano /etc/onionwatch/config.json`) нужна только для портов,
+интервалов и таймаутов и требует `sudo systemctl restart onionwatch`.
 
 **Обновление кода**
 
 ```bash
-scp onionwatch.py dashboard.html admin@<IP>:~/onionwatch/
+scp onionwatch.py dashboard.html admin.html admin@<IP>:~/onionwatch/
 sudo install -o root -g root -m 0644 ~/onionwatch/onionwatch.py  /opt/onionwatch/
 sudo install -o root -g root -m 0644 ~/onionwatch/dashboard.html /opt/onionwatch/
+sudo install -o root -g root -m 0644 ~/onionwatch/admin.html     /opt/onionwatch/
 sudo systemctl restart onionwatch
 ```
 
@@ -548,6 +573,9 @@ sudo systemctl daemon-reload
 | В логе у всех целей `tor_down` | `tor` не запущен: `systemctl status tor@default`, `ss -ltnp \| grep 9050` |
 | Все цели `descriptor_not_found` | Tor не догрузился: ищите `Bootstrapped 100%` в `journalctl -u tor@default`. Часто виноваты часы — проверьте `timedatectl` |
 | Одна цель `descriptor_not_found` | сервис выключен либо адрес с опечаткой |
+| У всех целей `general_failure` | в `torrc` нет `ExtendedErrors` — Tor не сообщает причину (раздел 2). Если он там есть, значит адрес действительно не разбирается: проверьте его в админке |
+| Не войти в админку, пароль забыт | заведите заново: `sudo -u onionwatch python3 /opt/onionwatch/onionwatch.py --config /etc/onionwatch/config.json --set-admin admin` |
+| `Слишком много попыток` при входе | сработала защита от подбора: 8 неудач с адреса, ждать 15 минут либо перезапустить сервис |
 | `client_auth_missing` | сервис требует клиентский ключ; onionwatch авторизацию не передаёт — добавьте ключ в `ClientOnionAuthDir` в `torrc` |
 | `timeout` у всех целей | увеличьте `timeout` до 90–120 с и снизьте `concurrency`; на слабых VPS цепочки строятся долго |
 | Сервис падает с `Read-only file system` | `db_path` вне `/var/lib/onionwatch` — юнит запрещает запись в другие места |
@@ -565,6 +593,8 @@ sudo systemctl daemon-reload
 - [ ] `timedatectl` показывает синхронизацию времени
 - [ ] `tor@default` активен, `curl --socks5-hostname` возвращает `"IsTor":true`
 - [ ] `onionwatch` в статусе `active (running)` и включён в автозапуск
+- [ ] В `torrc` включён `ExtendedErrors` — иначе причины сбоев не видны
+- [ ] Администратор создан, вход в `/admin` работает, цели заведены
 - [ ] `--once` отрабатывает без ошибок `tor_down`
 - [ ] Дашборд открывается через SSH-туннель или onion-адрес с клиентским ключом
 - [ ] Таймер оповещений включён и хотя бы раз отработал
