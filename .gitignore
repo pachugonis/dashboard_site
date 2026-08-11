@@ -1,0 +1,11 @@
+# локальный конфиг с реальными onion-адресами
+config.json
+
+# база с историей проверок
+*.db
+*.db-wal
+*.db-shm
+
+__pycache__/
+*.pyc
+.DS_Store

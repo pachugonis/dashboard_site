@@ -1,0 +1,52 @@
+[Unit]
+Description=onionwatch — мониторинг доступности onion-сервисов
+Documentation=file:/opt/onionwatch/README.md
+After=network-online.target tor.service
+Wants=network-online.target tor.service
+
+[Service]
+Type=exec
+User=onionwatch
+Group=onionwatch
+WorkingDirectory=/opt/onionwatch
+ExecStart=/usr/bin/python3 /opt/onionwatch/onionwatch.py --config /etc/onionwatch/config.json
+Restart=always
+RestartSec=10s
+
+# База истории: systemd сам создаст /var/lib/onionwatch с нужными правами
+StateDirectory=onionwatch
+StateDirectoryMode=0750
+UMask=0077
+
+# Сервису нужен только петлевой интерфейс: весь внешний трафик идёт через
+# локальный SOCKS-порт tor. Прямой выход в сеть запрещён на уровне ядра.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
