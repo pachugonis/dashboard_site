@@ -278,31 +278,52 @@ function prepareImage(file) {
 
 // Обрезка в квадрат по центру и уменьшение делаются здесь: у демона нет
 // библиотек для работы с картинками, и заводить их ради этого не хочется.
-async function squareCrop(file) {
-  const img = await loadImage(await readDataUrl(file));
+function cropToSquare(img, size) {
   const side = Math.min(img.naturalWidth, img.naturalHeight);
-  if (!side) throw new Error("Не удалось определить размер изображения");
-
   const canvas = document.createElement("canvas");
-  canvas.width = canvas.height = IMG_SIZE;
+  canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d");
   ctx.imageSmoothingQuality = "high";
   ctx.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2,
-                side, side, 0, 0, IMG_SIZE, IMG_SIZE);
+                side, side, 0, 0, size, size);
+  return canvas;
+}
 
+function hasAlpha(canvas) {
+  const data = canvas.getContext("2d")
+    .getImageData(0, 0, canvas.width, canvas.height).data;
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] < 255) return true;
+  }
+  return false;
+}
+
+async function squareCrop(file) {
+  const img = await loadImage(await readDataUrl(file));
+  if (!Math.min(img.naturalWidth, img.naturalHeight)) {
+    throw new Error("Не удалось определить размер изображения");
+  }
+  const canvas = cropToSquare(img, IMG_SIZE);
+
+  // Картинку с прозрачностью в JPEG переводить нельзя: он прозрачность не
+  // умеет, под неё пришлось бы подложить фон — и светлый логотип, нарисованный
+  // по прозрачному, слился бы с ним начисто. Такие остаются PNG, а если не
+  // влезают в лимит, уменьшаем сторону, но формат не меняем.
+  if (hasAlpha(canvas)) {
+    for (const size of [IMG_SIZE, 192, 160, 128]) {
+      const out = (size === IMG_SIZE ? canvas : cropToSquare(img, size))
+        .toDataURL("image/png");
+      if (out.length <= IMG_MAX_CHARS) return out;
+    }
+    throw new Error("Прозрачное изображение слишком тяжёлое — уменьшите его заранее");
+  }
+
+  // Непрозрачное: плоский логотип в PNG весит единицы килобайт, фотография —
+  // сотни. Дашборд ходит через Tor, где каждый килобайт заметен, поэтому
+  // тяжёлое пережимаем в JPEG. Терять здесь нечего — прозрачности нет.
   let out = canvas.toDataURL("image/png");
   if (out.length > 60000) {
-    // Плоские логотипы в PNG весят единицы килобайт и сохраняют прозрачность,
-    // а фотография — сотни. Дашборд ходит через Tor, где каждый килобайт
-    // заметен, поэтому всё тяжёлое пережимаем в JPEG, подложив белый фон:
-    // прозрачность в JPEG всё равно не переживёт.
-    const flat = document.createElement("canvas");
-    flat.width = flat.height = IMG_SIZE;
-    const fx = flat.getContext("2d");
-    fx.fillStyle = "#ffffff";
-    fx.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
-    fx.drawImage(canvas, 0, 0);
-    out = flat.toDataURL("image/jpeg", 0.85);
+    out = canvas.toDataURL("image/jpeg", 0.85);
   }
   if (out.length > IMG_MAX_CHARS) throw new Error("Изображение слишком тяжёлое");
   return out;
