@@ -1152,6 +1152,26 @@ async def run_once(cfg: Config, store: Store) -> int:
     return 1 if down else 0
 
 
+def open_store(path: str) -> Store:
+    """Открывает базу, объясняя проблемы с правами по-человечески."""
+    try:
+        return Store(path)
+    except sqlite3.OperationalError as e:
+        directory = os.path.dirname(path) or "."
+        user = getpass.getuser()
+        print(
+            f"База {path} не открылась на запись: {e}\n"
+            f"Процесс работает от пользователя {user!r}. Записывать нужно и в саму базу,\n"
+            f"и в каталог рядом с ней: в режиме WAL SQLite создаёт там файлы -wal и -shm.\n"
+            f"Посмотрите, кому принадлежат каталог и файлы:\n"
+            f"  ls -ld {directory} {path}*\n"
+            f"Если владелец не {user!r}, поправьте:\n"
+            f"  sudo chown -R onionwatch:onionwatch {directory}\n"
+            f"  sudo chmod 0750 {directory}",
+            file=sys.stderr)
+        raise SystemExit(2) from e
+
+
 def set_admin_interactive(store: Store, login: str) -> int:
     print(f"Пароль для администратора {login!r} (минимум 10 символов).")
     password = getpass.getpass("Пароль: ")
@@ -1183,7 +1203,7 @@ def main() -> int:
         print(f"Конфиг не прочитан: {e}", file=sys.stderr)
         return 2
 
-    store = Store(cfg.db_path)
+    store = open_store(cfg.db_path)
 
     if args.set_admin:
         return set_admin_interactive(store, args.set_admin)
