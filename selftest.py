@@ -302,7 +302,21 @@ async def main() -> int:
           any(t["id"] == img_id for t in api("GET", "/api/admin/targets")[1]["targets"]), True)
     api("DELETE", f"/api/admin/targets/{img_id}")
 
-    print("\n8. Смена пароля и выход")
+    print("\n8. Страницы и заголовок CSP")
+    # Страницы и CSP правятся порознь, и рассогласование не видно ни в одном
+    # серверном тесте: браузер просто молча не загружает ресурс. Схема blob:
+    # в img-src не разрешена, поэтому createObjectURL для картинок непригоден.
+    csp = api.raw("/admin")[1].get("Content-Security-Policy", "")
+    check("CSP разрешает картинки из data:", "data:" in csp, True)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for page in ("admin.html", "dashboard.html"):
+        text = open(os.path.join(here, page), encoding="utf-8").read()
+        code = "\n".join(line for line in text.splitlines()
+                         if not line.lstrip().startswith("//"))   # без комментариев
+        check(f"{page}: не грузит картинки по схеме, запрещённой CSP",
+              "createObjectURL" not in code or "blob:" in csp, True)
+
+    print("\n9. Смена пароля и выход")
     check("смена с неверным текущим",
           api("POST", "/api/admin/password", {"current": "nope", "password": "x" * 12})[0], 403)
     check("короткий новый пароль",

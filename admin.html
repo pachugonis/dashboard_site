@@ -236,26 +236,40 @@ let pendingImage = null, clearImage = false;
 const IMG_SIZE = 256;          // сторона квадрата, который уходит на сервер
 const IMG_MAX_CHARS = 690000;  // потолок сервера — 512 КБ, это они же в base64
 
-// GIF отправляем как есть. Перерисовка через canvas оставила бы от анимации
-// один кадр, а собрать GIF обратно браузер не умеет — в квадрат его обрезает
-// вёрстка (квадратный бокс плюс object-fit/background-size: cover).
-function passThroughGif(file) {
+// Файл читаем в data-URL, а не через URL.createObjectURL: CSP страницы
+// разрешает картинки только из 'self' и data:, и схему blob: браузер
+// заблокирует — изображение просто не загрузится.
+function readDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = () => {
-      const url = String(reader.result || "");
-      if (!/^data:image\/gif;base64,/.test(url)) {
-        return reject(new Error("Файл не читается как GIF"));
-      }
-      if (url.length > IMG_MAX_CHARS) {
-        return reject(new Error("GIF тяжелее 512 КБ — анимацию нельзя ужать "
-                              + "в браузере, уменьшите файл заранее"));
-      }
-      resolve(url);
-    };
+    reader.onload = () => resolve(String(reader.result || ""));
     reader.onerror = () => reject(new Error("Файл не прочитался"));
     reader.readAsDataURL(file);
   });
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Файл не читается как изображение"));
+    img.src = src;
+  });
+}
+
+// GIF отправляем как есть. Перерисовка через canvas оставила бы от анимации
+// один кадр, а собрать GIF обратно браузер не умеет — в квадрат его обрезает
+// вёрстка (квадратный бокс плюс object-fit/background-size: cover).
+async function passThroughGif(file) {
+  const url = await readDataUrl(file);
+  if (!/^data:image\/gif;base64,/.test(url)) {
+    throw new Error("Файл не читается как GIF");
+  }
+  if (url.length > IMG_MAX_CHARS) {
+    throw new Error("GIF тяжелее 512 КБ — анимацию нельзя ужать "
+                  + "в браузере, уменьшите файл заранее");
+  }
+  return url;
 }
 
 function prepareImage(file) {
@@ -264,43 +278,34 @@ function prepareImage(file) {
 
 // Обрезка в квадрат по центру и уменьшение делаются здесь: у демона нет
 // библиотек для работы с картинками, и заводить их ради этого не хочется.
-function squareCrop(file) {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      const side = Math.min(img.naturalWidth, img.naturalHeight);
-      if (!side) return reject(new Error("Не удалось определить размер изображения"));
-      const canvas = document.createElement("canvas");
-      canvas.width = canvas.height = IMG_SIZE;
-      const ctx = canvas.getContext("2d");
-      ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2,
-                    side, side, 0, 0, IMG_SIZE, IMG_SIZE);
-      let out = canvas.toDataURL("image/png");
-      if (out.length > 60000) {
-        // Плоские логотипы в PNG весят единицы килобайт и сохраняют прозрачность,
-        // а фотография — сотни. Дашборд ходит через Tor, где каждый килобайт
-        // заметен, поэтому всё тяжёлое пережимаем в JPEG, подложив белый фон:
-        // прозрачность в JPEG всё равно не переживёт.
-        const flat = document.createElement("canvas");
-        flat.width = flat.height = IMG_SIZE;
-        const fx = flat.getContext("2d");
-        fx.fillStyle = "#ffffff";
-        fx.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
-        fx.drawImage(canvas, 0, 0);
-        out = flat.toDataURL("image/jpeg", 0.85);
-      }
-      if (out.length > IMG_MAX_CHARS) return reject(new Error("Изображение слишком тяжёлое"));
-      resolve(out);
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error("Файл не читается как изображение"));
-    };
-    img.src = url;
-  });
+async function squareCrop(file) {
+  const img = await loadImage(await readDataUrl(file));
+  const side = Math.min(img.naturalWidth, img.naturalHeight);
+  if (!side) throw new Error("Не удалось определить размер изображения");
+
+  const canvas = document.createElement("canvas");
+  canvas.width = canvas.height = IMG_SIZE;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2,
+                side, side, 0, 0, IMG_SIZE, IMG_SIZE);
+
+  let out = canvas.toDataURL("image/png");
+  if (out.length > 60000) {
+    // Плоские логотипы в PNG весят единицы килобайт и сохраняют прозрачность,
+    // а фотография — сотни. Дашборд ходит через Tor, где каждый килобайт
+    // заметен, поэтому всё тяжёлое пережимаем в JPEG, подложив белый фон:
+    // прозрачность в JPEG всё равно не переживёт.
+    const flat = document.createElement("canvas");
+    flat.width = flat.height = IMG_SIZE;
+    const fx = flat.getContext("2d");
+    fx.fillStyle = "#ffffff";
+    fx.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
+    fx.drawImage(canvas, 0, 0);
+    out = flat.toDataURL("image/jpeg", 0.85);
+  }
+  if (out.length > IMG_MAX_CHARS) throw new Error("Изображение слишком тяжёлое");
+  return out;
 }
 
 function showThumb(src) {
