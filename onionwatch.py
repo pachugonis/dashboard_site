@@ -73,12 +73,15 @@ MAX_IMAGE = 512 * 1024
 
 # Картинку обрезает и уменьшает браузер, сюда приходит готовый квадрат.
 # Сервер обязан перепроверить формат: доверять Content-Type от клиента нельзя.
+# GIF — исключение: он приходит как есть, без перекодирования, иначе от
+# анимации остался бы первый кадр. В квадрат его обрезает уже вёрстка.
 IMAGE_MAGIC = {
-    "image/png": b"\x89PNG\r\n\x1a\n",
-    "image/jpeg": b"\xff\xd8\xff",
-    "image/webp": b"RIFF",
+    "image/png": (b"\x89PNG\r\n\x1a\n",),
+    "image/jpeg": (b"\xff\xd8\xff",),
+    "image/webp": (b"RIFF",),
+    "image/gif": (b"GIF87a", b"GIF89a"),
 }
-DATA_URL = re.compile(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)")
+DATA_URL = re.compile(r"data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=\s]+)")
 
 
 class ProxyDown(Exception):
@@ -284,6 +287,8 @@ def parse_image(data_url: str) -> tuple[bytes, str]:
     # Проверяем сигнатуру: заявленный тип должен совпадать с содержимым.
     if not blob.startswith(IMAGE_MAGIC[ctype]):
         raise Invalid("Содержимое файла не похоже на заявленный формат")
+    if ctype == "image/gif" and not blob.rstrip(b"\x00").endswith(b";"):
+        raise Invalid("GIF обрывается — файл повреждён или загрузился не целиком")
     if ctype == "image/webp" and blob[8:12] != b"WEBP":
         raise Invalid("Файл начинается как RIFF, но это не WebP")
     return blob, ctype

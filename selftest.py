@@ -91,6 +91,18 @@ def make_png(side: int = 2) -> bytes:
             + chunk(b"IEND", b""))
 
 
+def make_gif() -> bytes:
+    """Минимальный, но настоящий GIF 1x1: заголовок, палитра, кадр, терминатор."""
+    return (b"GIF89a"
+            + b"\x01\x00\x01\x00"                  # ширина и высота
+            + b"\x80\x00\x00"                      # глобальная палитра из двух цветов
+            + b"\xff\xff\xff\x00\x00\x00"          # белый и чёрный
+            + b"\x21\xf9\x04\x01\x00\x00\x00\x00"  # управление графикой
+            + b"\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00"  # дескриптор кадра
+            + b"\x02\x02\x44\x01\x00"              # данные LZW
+            + b"\x3b")                             # трейлер
+
+
 def data_url(blob: bytes, ctype: str = "image/png") -> str:
     return f"data:{ctype};base64," + base64.b64encode(blob).decode()
 
@@ -257,8 +269,21 @@ async def main() -> int:
     check("отдаётся уже новая картинка",
           api.raw(f"/api/targets/{img_id}/image")[2] == make_png(3), True)
 
+    gif = make_gif()
+    code, gif_made = api("POST", "/api/admin/targets",
+                         {"name": "с-гифкой", "url": f"http://{GOOD}/anim",
+                          "image": data_url(gif, "image/gif")})
+    check("цель с GIF создана", code, 201)
+    gif_id = gif_made.get("id")
+    status, headers, body = api.raw(f"/api/targets/{gif_id}/image")
+    check("GIF отдаётся как GIF", headers.get("Content-Type"), "image/gif")
+    check("GIF не перекодирован — байты те же", body == gif, True)
+    api("DELETE", f"/api/admin/targets/{gif_id}")
+
     for label, payload in [
         ("мусор вместо data-URL", "просто строка"),
+        ("GIF без трейлера", data_url(gif[:-1], "image/gif")),
+        ("PNG под видом GIF", data_url(png, "image/gif")),
         ("чужая схема данных", "data:text/html;base64,PGh0bWw+"),
         ("тип не совпадает с содержимым", data_url(png, "image/jpeg")),
         ("пустое содержимое", "data:image/png;base64,"),

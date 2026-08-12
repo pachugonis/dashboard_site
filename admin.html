@@ -180,8 +180,9 @@
             <div class="img-ctl">
               <input type="file" id="f-file" accept="image/png,image/jpeg,image/webp,image/gif">
               <button type="button" id="f-img-clear" class="hidden">Убрать изображение</button>
-              <div class="hint">Обрезается по центру в квадрат 256×256 прямо в браузере —
-                на сервер уходит уже готовая картинка. PNG, JPEG, WebP или GIF.</div>
+              <div class="hint">PNG, JPEG и WebP обрезаются по центру в квадрат 256×256
+                прямо в браузере. GIF уходит как есть, чтобы сохранить анимацию,
+                и обрезается уже при показе — до 512 КБ.</div>
             </div>
           </div>
         </div>
@@ -234,6 +235,32 @@ let pendingImage = null, clearImage = false;
 
 const IMG_SIZE = 256;          // сторона квадрата, который уходит на сервер
 const IMG_MAX_CHARS = 690000;  // потолок сервера — 512 КБ, это они же в base64
+
+// GIF отправляем как есть. Перерисовка через canvas оставила бы от анимации
+// один кадр, а собрать GIF обратно браузер не умеет — в квадрат его обрезает
+// вёрстка (квадратный бокс плюс object-fit/background-size: cover).
+function passThroughGif(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const url = String(reader.result || "");
+      if (!/^data:image\/gif;base64,/.test(url)) {
+        return reject(new Error("Файл не читается как GIF"));
+      }
+      if (url.length > IMG_MAX_CHARS) {
+        return reject(new Error("GIF тяжелее 512 КБ — анимацию нельзя ужать "
+                              + "в браузере, уменьшите файл заранее"));
+      }
+      resolve(url);
+    };
+    reader.onerror = () => reject(new Error("Файл не прочитался"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function prepareImage(file) {
+  return file.type === "image/gif" ? passThroughGif(file) : squareCrop(file);
+}
 
 // Обрезка в квадрат по центру и уменьшение делаются здесь: у демона нет
 // библиотек для работы с картинками, и заводить их ради этого не хочется.
@@ -434,7 +461,7 @@ el("f-file").addEventListener("change", async ev => {
   if (!file) return;
   say("f-msg", "", "");
   try {
-    pendingImage = await squareCrop(file);
+    pendingImage = await prepareImage(file);
     clearImage = false;
     showThumb(pendingImage);
   } catch (e) {
