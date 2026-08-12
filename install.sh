@@ -97,13 +97,28 @@ systemctl enable onionwatch.service >/dev/null
 # нужно завести до первого старта — создаём каталог сами.
 install -d -o "${USER_NAME}" -g "${USER_NAME}" -m 0750 "${STATE_DIR}"
 
-systemctl restart onionwatch
-say "Сервис запущен: systemctl status onionwatch"
+DB="${STATE_DIR}/onionwatch.db"
+
+# База и её WAL-файлы должны принадлежать сервису. Если что-то запускалось от
+# root, они остаются root:root, и демон падает с «readonly database».
+shopt -s nullglob
+for f in "${DB}" "${DB}"-*; do
+  chown "${USER_NAME}:${USER_NAME}" "$f"
+done
+shopt -u nullglob
 
 # Целей в конфиге больше нет: они заводятся в админке, а вход в неё — по
 # логину и паролю. Без администратора добавить их будет некому.
-ADMINS=$(sqlite3 "${STATE_DIR}/onionwatch.db" \
-         "SELECT COUNT(*) FROM admins" 2>/dev/null || echo 0)
+#
+# Администратора заводим до старта сервиса и строго от имени ${USER_NAME}:
+# запуск от root создал бы базу с чужим владельцем. По той же причине sqlite3
+# зовём только на уже существующем файле — на отсутствующем он молча создаёт
+# пустую базу от того, кто его запустил.
+ADMINS=0
+if [[ -s ${DB} ]]; then
+  ADMINS=$(sudo -u "${USER_NAME}" sqlite3 -readonly "${DB}" \
+           "SELECT COUNT(*) FROM admins" 2>/dev/null || echo 0)
+fi
 if [[ ${ADMINS} -eq 0 ]]; then
   if [[ -t 0 ]]; then
     say "Создаю администратора для входа в админку"
@@ -115,6 +130,9 @@ if [[ ${ADMINS} -eq 0 ]]; then
            "${USER_NAME}" "${APP_DIR}" "${CFG_DIR}" >&2
   fi
 fi
+
+systemctl restart onionwatch
+say "Сервис запущен: systemctl status onionwatch"
 
 cat <<EOF
 
