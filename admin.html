@@ -81,13 +81,13 @@
   .img-ctl input[type=file] { padding: 6px 8px; font-size: 13px; }
   .img-ctl button { margin-top: 8px; padding: 6px 10px; font-size: 12px; }
   .thumb { flex: none; width: 84px; height: 84px; border-radius: 12px;
-    border: 1px dashed var(--line); background: var(--panel-2) center/cover no-repeat;
+    border: 1px dashed var(--line); background: var(--panel-2) center/contain no-repeat;
     display: flex; align-items: center; justify-content: center;
     font-family: var(--mono); font-size: 10px; color: var(--dim); text-align: center; }
   .thumb.set { border-style: solid; }
   /* Миниатюра в списке целей — тот же квадрат, только мельче. */
   .t-thumb { width: 34px; height: 34px; border-radius: 8px; flex: none;
-    background: var(--panel-2) center/cover no-repeat; border: 1px solid var(--line); }
+    background: var(--panel-2) center/contain no-repeat; border: 1px solid var(--line); }
   .t-head { display: flex; gap: 10px; align-items: center; }
 
   .msg { border-radius: 8px; padding: 10px 14px; margin-top: 14px; font-size: 14px; }
@@ -179,10 +179,15 @@
             <div class="thumb" id="f-thumb" aria-hidden="true"></div>
             <div class="img-ctl">
               <input type="file" id="f-file" accept="image/png,image/jpeg,image/webp,image/gif">
+              <select id="f-fit">
+                <option value="fit">вписать целиком, поля прозрачные</option>
+                <option value="crop">обрезать по центру</option>
+              </select>
               <button type="button" id="f-img-clear" class="hidden">Убрать изображение</button>
-              <div class="hint">PNG, JPEG и WebP обрезаются по центру в квадрат 256×256
-                прямо в браузере. GIF уходит как есть, чтобы сохранить анимацию,
-                и обрезается уже при показе — до 512 КБ.</div>
+              <div class="hint">Квадрат 256×256 собирается прямо в браузере.
+                «Вписать» сохраняет логотип целиком и нужен для широких картинок;
+                «обрезать» вырезает центр и подходит фотографиям. GIF уходит как
+                есть, чтобы сохранить анимацию, — до 512 КБ.</div>
             </div>
           </div>
         </div>
@@ -231,7 +236,7 @@ const el = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 let editing = null, defaults = { interval: 300, timeout: 60 };
 // Картинка, выбранная в форме, но ещё не сохранённая, и флаг «удалить имеющуюся».
-let pendingImage = null, clearImage = false;
+let pendingImage = null, clearImage = false, pendingFile = null;
 
 const IMG_SIZE = 256;          // сторона квадрата, который уходит на сервер
 const IMG_MAX_CHARS = 690000;  // потолок сервера — 512 КБ, это они же в base64
@@ -272,20 +277,30 @@ async function passThroughGif(file) {
   return url;
 }
 
-function prepareImage(file) {
-  return file.type === "image/gif" ? passThroughGif(file) : squareCrop(file);
+function prepareImage(file, mode) {
+  return file.type === "image/gif" ? passThroughGif(file) : squareCrop(file, mode);
 }
 
 // Обрезка в квадрат по центру и уменьшение делаются здесь: у демона нет
 // библиотек для работы с картинками, и заводить их ради этого не хочется.
-function cropToSquare(img, size) {
-  const side = Math.min(img.naturalWidth, img.naturalHeight);
+// Два способа привести к квадрату. «fit» вписывает картинку целиком, добирая
+// поля прозрачным, — для широкого логотипа только так он и останется виден.
+// «crop» вырезает центр: годится для фотографий, но у баннера съедает всё,
+// кроме узкой полоски посередине.
+function toSquare(img, size, mode) {
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d");
   ctx.imageSmoothingQuality = "high";
-  ctx.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2,
-                side, side, 0, 0, size, size);
+  const w = img.naturalWidth, h = img.naturalHeight;
+  if (mode === "crop") {
+    const side = Math.min(w, h);
+    ctx.drawImage(img, (w - side) / 2, (h - side) / 2, side, side, 0, 0, size, size);
+  } else {
+    const scale = Math.min(size / w, size / h);
+    const dw = Math.round(w * scale), dh = Math.round(h * scale);
+    ctx.drawImage(img, 0, 0, w, h, (size - dw) / 2, (size - dh) / 2, dw, dh);
+  }
   return canvas;
 }
 
@@ -298,12 +313,12 @@ function hasAlpha(canvas) {
   return false;
 }
 
-async function squareCrop(file) {
+async function squareCrop(file, mode) {
   const img = await loadImage(await readDataUrl(file));
   if (!Math.min(img.naturalWidth, img.naturalHeight)) {
     throw new Error("Не удалось определить размер изображения");
   }
-  const canvas = cropToSquare(img, IMG_SIZE);
+  const canvas = toSquare(img, IMG_SIZE, mode);
 
   // Картинку с прозрачностью в JPEG переводить нельзя: он прозрачность не
   // умеет, под неё пришлось бы подложить фон — и светлый логотип, нарисованный
@@ -311,7 +326,7 @@ async function squareCrop(file) {
   // влезают в лимит, уменьшаем сторону, но формат не меняем.
   if (hasAlpha(canvas)) {
     for (const size of [IMG_SIZE, 192, 160, 128]) {
-      const out = (size === IMG_SIZE ? canvas : cropToSquare(img, size))
+      const out = (size === IMG_SIZE ? canvas : toSquare(img, size, mode))
         .toDataURL("image/png");
       if (out.length <= IMG_MAX_CHARS) return out;
     }
@@ -455,6 +470,7 @@ function fillForm(t) {
   el("f-note").value = t ? t.note : "";
   el("f-enabled").checked = t ? t.enabled : true;
   pendingImage = null;
+  pendingFile = null;
   clearImage = false;
   el("f-file").value = "";
   // Свежий URL при каждом показе: иначе после замены увидим старую из кэша.
@@ -482,23 +498,31 @@ function formData() {
   };
 }
 
-el("f-file").addEventListener("change", async ev => {
-  const file = ev.target.files && ev.target.files[0];
-  if (!file) return;
+// Выбранный файл держим у себя: при смене способа его нужно пересобрать,
+// не заставляя выбирать заново.
+async function applyPickedFile() {
+  if (!pendingFile) return;
   say("f-msg", "", "");
   try {
-    pendingImage = await prepareImage(file);
+    pendingImage = await prepareImage(pendingFile, el("f-fit").value);
     clearImage = false;
     showThumb(pendingImage);
   } catch (e) {
     pendingImage = null;
-    ev.target.value = "";
+    showThumb(null);
     say("f-msg", e.message, "err");
   }
+}
+
+el("f-file").addEventListener("change", ev => {
+  pendingFile = (ev.target.files && ev.target.files[0]) || null;
+  applyPickedFile();
 });
+el("f-fit").addEventListener("change", applyPickedFile);
 
 el("f-img-clear").addEventListener("click", () => {
   pendingImage = null;
+  pendingFile = null;
   clearImage = true;
   el("f-file").value = "";
   showThumb(null);

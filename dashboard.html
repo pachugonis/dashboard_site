@@ -89,9 +89,10 @@
 
   .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
   .ident { display: flex; gap: 11px; align-items: center; min-width: 0; }
-  /* Картинка приходит уже квадратной; object-fit — страховка от чужих данных. */
+  /* PNG и JPEG приходят уже квадратными, а GIF сохраняется как есть — поэтому
+     contain, а не cover: широкую картинку надо показать целиком, а не срезать. */
   .avatar { width: 44px; height: 44px; flex: none; border-radius: 10px;
-    object-fit: cover; border: 1px solid var(--line); background: var(--panel-2); }
+    object-fit: contain; border: 1px solid var(--line); background: var(--panel-2); }
   .name { font-weight: 600; font-size: 16px; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .addr { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
