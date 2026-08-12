@@ -88,6 +88,10 @@
   .card.pending { border-top-color: var(--dim); }
 
   .head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+  .ident { display: flex; gap: 11px; align-items: center; min-width: 0; }
+  /* Картинка приходит уже квадратной; object-fit — страховка от чужих данных. */
+  .avatar { width: 44px; height: 44px; flex: none; border-radius: 10px;
+    object-fit: cover; border: 1px solid var(--line); background: var(--panel-2); }
   .name { font-weight: 600; font-size: 16px; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
   .addr { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
@@ -232,9 +236,14 @@ function card(t) {
   const port = (t.port !== 80 && t.port !== 443) ? ":" + t.port : "";
   return `<article class="card ${status}" data-name="${esc(t.name)}">
     <div class="head">
-      <div style="min-width:0">
-        <div class="name" title="${esc(t.name)}">${esc(t.name)}</div>
-        <div class="addr" title="${esc(t.url)}">${esc(t.host)}${port}</div>
+      <div class="ident">
+        ${t.has_image
+          ? `<img class="avatar" src="/api/targets/${t.id}/image?v=${t.image_v}" alt="">`
+          : ""}
+        <div style="min-width:0">
+          <div class="name" title="${esc(t.name)}">${esc(t.name)}</div>
+          <div class="addr" title="${esc(t.url)}">${esc(t.host)}${port}</div>
+        </div>
       </div>
       <span class="pill">${word}</span>
     </div>

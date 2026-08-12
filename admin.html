@@ -76,6 +76,20 @@
   td.act { text-align: right; white-space: nowrap; }
   td.act button { padding: 5px 9px; font-size: 12px; margin-left: 6px; }
 
+  .img-row { display: flex; gap: 14px; align-items: flex-start; }
+  .img-ctl { flex: 1 1 auto; min-width: 0; }
+  .img-ctl input[type=file] { padding: 6px 8px; font-size: 13px; }
+  .img-ctl button { margin-top: 8px; padding: 6px 10px; font-size: 12px; }
+  .thumb { flex: none; width: 84px; height: 84px; border-radius: 12px;
+    border: 1px dashed var(--line); background: var(--panel-2) center/cover no-repeat;
+    display: flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-size: 10px; color: var(--dim); text-align: center; }
+  .thumb.set { border-style: solid; }
+  /* Миниатюра в списке целей — тот же квадрат, только мельче. */
+  .t-thumb { width: 34px; height: 34px; border-radius: 8px; flex: none;
+    background: var(--panel-2) center/cover no-repeat; border: 1px solid var(--line); }
+  .t-head { display: flex; gap: 10px; align-items: center; }
+
   .msg { border-radius: 8px; padding: 10px 14px; margin-top: 14px; font-size: 14px; }
   .msg.err { border: 1px solid var(--down); background: rgba(255,93,115,.09); }
   .msg.ok { border: 1px solid var(--up); background: rgba(62,207,160,.09); }
@@ -159,6 +173,18 @@
           <label for="f-note">Заметка</label>
           <input id="f-note" placeholder="видна на карточке дашборда">
         </div>
+        <div class="wide">
+          <label>Изображение</label>
+          <div class="img-row">
+            <div class="thumb" id="f-thumb" aria-hidden="true"></div>
+            <div class="img-ctl">
+              <input type="file" id="f-file" accept="image/png,image/jpeg,image/webp,image/gif">
+              <button type="button" id="f-img-clear" class="hidden">Убрать изображение</button>
+              <div class="hint">Обрезается по центру в квадрат 256×256 прямо в браузере —
+                на сервер уходит уже готовая картинка. PNG, JPEG, WebP или GIF.</div>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="actions">
         <div class="check">
@@ -203,6 +229,60 @@
 const el = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 let editing = null, defaults = { interval: 300, timeout: 60 };
+// Картинка, выбранная в форме, но ещё не сохранённая, и флаг «удалить имеющуюся».
+let pendingImage = null, clearImage = false;
+
+const IMG_SIZE = 256;          // сторона квадрата, который уходит на сервер
+const IMG_MAX_CHARS = 690000;  // потолок сервера — 512 КБ, это они же в base64
+
+// Обрезка в квадрат по центру и уменьшение делаются здесь: у демона нет
+// библиотек для работы с картинками, и заводить их ради этого не хочется.
+function squareCrop(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const side = Math.min(img.naturalWidth, img.naturalHeight);
+      if (!side) return reject(new Error("Не удалось определить размер изображения"));
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = IMG_SIZE;
+      const ctx = canvas.getContext("2d");
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2,
+                    side, side, 0, 0, IMG_SIZE, IMG_SIZE);
+      let out = canvas.toDataURL("image/png");
+      if (out.length > 60000) {
+        // Плоские логотипы в PNG весят единицы килобайт и сохраняют прозрачность,
+        // а фотография — сотни. Дашборд ходит через Tor, где каждый килобайт
+        // заметен, поэтому всё тяжёлое пережимаем в JPEG, подложив белый фон:
+        // прозрачность в JPEG всё равно не переживёт.
+        const flat = document.createElement("canvas");
+        flat.width = flat.height = IMG_SIZE;
+        const fx = flat.getContext("2d");
+        fx.fillStyle = "#ffffff";
+        fx.fillRect(0, 0, IMG_SIZE, IMG_SIZE);
+        fx.drawImage(canvas, 0, 0);
+        out = flat.toDataURL("image/jpeg", 0.85);
+      }
+      if (out.length > IMG_MAX_CHARS) return reject(new Error("Изображение слишком тяжёлое"));
+      resolve(out);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Файл не читается как изображение"));
+    };
+    img.src = url;
+  });
+}
+
+function showThumb(src) {
+  const box = el("f-thumb");
+  box.style.backgroundImage = src ? `url("${src}")` : "";
+  box.classList.toggle("set", !!src);
+  box.textContent = src ? "" : "нет";
+  el("f-img-clear").classList.toggle("hidden", !src);
+}
 
 function say(node, text, kind) {
   el(node).innerHTML = text ? `<div class="msg ${kind}">${esc(text)}</div>` : "";
@@ -241,7 +321,7 @@ async function boot() {
     : "Администратор ещё не создан. Выполните на сервере: "
       + "python3 onionwatch.py --config <конфиг> --set-admin admin";
   show(s.authed);
-  if (s.authed) loadTargets();
+  if (s.authed) { showThumb(null); loadTargets(); }
 }
 
 // -- вход ------------------------------------------------------------------
@@ -269,9 +349,16 @@ for (const id of ["l-login", "l-pass"]) {
 function targetRow(t) {
   return `<tr>
     <td>
-      <div class="t-name">${esc(t.name)}</div>
-      <div class="t-url">${esc(t.url)}</div>
-      ${t.note ? `<div class="t-url">${esc(t.note)}</div>` : ""}
+      <div class="t-head">
+        ${t.has_image
+          ? `<div class="t-thumb" style="background-image:url('/api/targets/${t.id}/image')"></div>`
+          : ""}
+        <div style="min-width:0">
+          <div class="t-name">${esc(t.name)}</div>
+          <div class="t-url">${esc(t.url)}</div>
+          ${t.note ? `<div class="t-url">${esc(t.note)}</div>` : ""}
+        </div>
+      </div>
     </td>
     <td><span class="tag ${t.enabled ? "on" : "off"}">${t.enabled ? "проверяется" : "выключена"}</span></td>
     <td class="spec">${esc(t.mode)} · ${Math.round(t.interval/60)} мин · ${Math.round(t.timeout)} с<br>
@@ -314,6 +401,11 @@ function fillForm(t) {
   el("f-text").value = t ? (t.expect_text || "") : "";
   el("f-note").value = t ? t.note : "";
   el("f-enabled").checked = t ? t.enabled : true;
+  pendingImage = null;
+  clearImage = false;
+  el("f-file").value = "";
+  // Свежий URL при каждом показе: иначе после замены увидим старую из кэша.
+  showThumb(t && t.has_image ? `/api/targets/${t.id}/image?v=${Date.now()}` : null);
   el("form-title").textContent = t ? `Цель «${t.name}»` : "Новая цель";
   el("f-save").textContent = t ? "Сохранить" : "Добавить";
   el("f-cancel").classList.toggle("hidden", !t);
@@ -332,8 +424,32 @@ function formData() {
     expect_text: el("f-text").value.trim(),
     note: el("f-note").value.trim(),
     enabled: el("f-enabled").checked,
+    image: pendingImage,
+    image_clear: clearImage,
   };
 }
+
+el("f-file").addEventListener("change", async ev => {
+  const file = ev.target.files && ev.target.files[0];
+  if (!file) return;
+  say("f-msg", "", "");
+  try {
+    pendingImage = await squareCrop(file);
+    clearImage = false;
+    showThumb(pendingImage);
+  } catch (e) {
+    pendingImage = null;
+    ev.target.value = "";
+    say("f-msg", e.message, "err");
+  }
+});
+
+el("f-img-clear").addEventListener("click", () => {
+  pendingImage = null;
+  clearImage = true;
+  el("f-file").value = "";
+  showThumb(null);
+});
 
 el("f-save").addEventListener("click", async () => {
   el("f-save").disabled = true;

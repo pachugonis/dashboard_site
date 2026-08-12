@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import getpass
 import hashlib
 import hmac
@@ -66,7 +68,17 @@ SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32, "maxmem": 64 * 1024 * 1024}
 
 ONION_V3 = re.compile(r"^[a-z2-7]{56}\.onion$")
 NAME_RE = re.compile(r"^[^/\\\x00-\x1f]{1,64}$")
-MAX_BODY = 64 * 1024
+MAX_BODY = 1024 * 1024        # в теле может приехать картинка в base64
+MAX_IMAGE = 512 * 1024
+
+# Картинку обрезает и уменьшает браузер, сюда приходит готовый квадрат.
+# Сервер обязан перепроверить формат: доверять Content-Type от клиента нельзя.
+IMAGE_MAGIC = {
+    "image/png": b"\x89PNG\r\n\x1a\n",
+    "image/jpeg": b"\xff\xd8\xff",
+    "image/webp": b"RIFF",
+}
+DATA_URL = re.compile(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/=\s]+)")
 
 
 class ProxyDown(Exception):
@@ -100,6 +112,8 @@ class Target:
     note: str = ""
     id: int = 0
     enabled: bool = True
+    has_image: bool = False
+    updated_at: float = 0.0
     # разобранный url
     host: str = ""
     port: int = 80
@@ -253,6 +267,36 @@ def clean_target(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
     return row
 
 
+def parse_image(data_url: str) -> tuple[bytes, str]:
+    """Разбирает data-URL от админки в (байты, тип). Бросает Invalid с текстом для UI."""
+    m = DATA_URL.fullmatch(str(data_url).strip())
+    if not m:
+        raise Invalid("Изображение должно быть data-URL в формате PNG, JPEG или WebP")
+    ctype = m.group(1)
+    try:
+        blob = base64.b64decode(m.group(2), validate=False)
+    except (binascii.Error, ValueError) as e:
+        raise Invalid("Изображение не декодируется из base64") from e
+    if not blob:
+        raise Invalid("Изображение пустое")
+    if len(blob) > MAX_IMAGE:
+        raise Invalid(f"Изображение больше {MAX_IMAGE // 1024} КБ — уменьшите его")
+    # Проверяем сигнатуру: заявленный тип должен совпадать с содержимым.
+    if not blob.startswith(IMAGE_MAGIC[ctype]):
+        raise Invalid("Содержимое файла не похоже на заявленный формат")
+    if ctype == "image/webp" and blob[8:12] != b"WEBP":
+        raise Invalid("Файл начинается как RIFF, но это не WebP")
+    return blob, ctype
+
+
+def _field(r: Any, key: str, default: Any = None) -> Any:
+    """Строка базы или словарь из формы — второй набор ключей беднее."""
+    try:
+        return r[key]
+    except (KeyError, IndexError):
+        return default
+
+
 def row_to_target(r: Any, cfg: Config) -> Target:
     return Target(
         name=r["name"],
@@ -265,6 +309,8 @@ def row_to_target(r: Any, cfg: Config) -> Target:
         note=r["note"] or "",
         id=int(r["id"] or 0),
         enabled=bool(r["enabled"]),
+        has_image=_field(r, "image") is not None,
+        updated_at=float(_field(r, "updated_at") or 0.0),
     )
 
 
@@ -481,7 +527,9 @@ class Store:
                     note TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
                     created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
+                    updated_at REAL NOT NULL,
+                    image BLOB,
+                    image_type TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS admins (
@@ -500,6 +548,11 @@ class Store:
                 );
                 """
             )
+            # База, созданная до появления картинок, этих колонок не имеет.
+            have = {r["name"] for r in self.db.execute("PRAGMA table_info(targets)")}
+            for column, decl in (("image", "BLOB"), ("image_type", "TEXT")):
+                if column not in have:
+                    self.db.execute(f"ALTER TABLE targets ADD COLUMN {column} {decl}")
             self.db.commit()
 
     # -- проверки ----------------------------------------------------------
@@ -609,6 +662,34 @@ class Store:
             self.db.commit()
             self.targets_rev += 1
             return row["name"]
+
+    def set_image(self, tid: int, blob: bytes, ctype: str) -> None:
+        # updated_at двигаем всегда: он попадает в URL картинки как версия,
+        # иначе браузеры будут показывать старую из кэша.
+        with self.lock:
+            cur = self.db.execute(
+                "UPDATE targets SET image=?, image_type=?, updated_at=? WHERE id=?",
+                (blob, ctype, time.time(), tid))
+            if not cur.rowcount:
+                raise Invalid("Цель не найдена")
+            self.db.commit()
+            self.targets_rev += 1
+
+    def clear_image(self, tid: int) -> None:
+        with self.lock:
+            self.db.execute(
+                "UPDATE targets SET image=NULL, image_type=NULL, updated_at=? WHERE id=?",
+                (time.time(), tid))
+            self.db.commit()
+            self.targets_rev += 1
+
+    def image(self, tid: int) -> tuple[bytes, str] | None:
+        with self.lock:
+            row = self.db.execute(
+                "SELECT image, image_type FROM targets WHERE id=?", (tid,)).fetchone()
+        if not row or row["image"] is None:
+            return None
+        return row["image"], row["image_type"] or "image/png"
 
     def seed_targets(self, cfg: Config) -> int:
         """Разовый импорт targets[] из конфига, пока таблица пуста."""
@@ -822,6 +903,8 @@ class Monitor:
                 "port": t.port,
                 "mode": t.mode,
                 "note": t.note,
+                "has_image": t.has_image,
+                "image_v": int(t.updated_at),
                 "interval": t.interval,
                 "checking": t.name in self.running,
                 "last": last,
@@ -891,11 +974,15 @@ def make_handler(monitor: Monitor):
 
         # -- примитивы ----------------------------------------------------
 
-        def _send(self, code: int, body: bytes, ctype: str, cookie: str | None = None) -> None:
+        def _send(self, code: int, body: bytes, ctype: str, cookie: str | None = None,
+                  extra: dict[str, str] | None = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            for key, value in (extra or {}).items():
+                self.send_header(key, value)
+            if not (extra or {}).get("Cache-Control"):
+                self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Frame-Options", "DENY")
@@ -1008,6 +1095,11 @@ def make_handler(monitor: Monitor):
                         return self._json(401, {"error": "Нужен вход"})
                     return self._json(200, monitor.state())
 
+                if path.startswith("/api/targets/") and path.endswith("/image"):
+                    if not self._public_ok():
+                        return self._json(401, {"error": "Нужен вход"})
+                    return self._serve_image(self._target_id(path[:-len("/image")]))
+
                 if path.startswith("/api/targets/") and path.endswith("/history"):
                     if not self._public_ok():
                         return self._json(401, {"error": "Нужен вход"})
@@ -1022,7 +1114,7 @@ def make_handler(monitor: Monitor):
                         "id": t.id, "name": t.name, "url": t.url, "mode": t.mode,
                         "interval": t.interval, "timeout": t.timeout,
                         "expect_status": t.expect_status, "expect_text": t.expect_text,
-                        "note": t.note, "enabled": t.enabled,
+                        "note": t.note, "enabled": t.enabled, "has_image": t.has_image,
                     } for t in store.list_targets(cfg)]
                     return self._json(200, {"targets": rows,
                                             "defaults": {"interval": cfg.interval,
@@ -1057,8 +1149,9 @@ def make_handler(monitor: Monitor):
                 if path == "/api/admin/targets":
                     if not self._require_admin():
                         return None
-                    row = clean_target(self._body(), cfg)
-                    tid = store.add_target(row)
+                    data = self._body()
+                    tid = store.add_target(clean_target(data, cfg))
+                    self._apply_image(tid, data)
                     monitor.sync_targets()
                     return self._json(201, {"id": tid})
 
@@ -1084,7 +1177,9 @@ def make_handler(monitor: Monitor):
                     if not self._require_admin():
                         return None
                     tid = self._target_id(path)
-                    store.update_target(tid, clean_target(self._body(), cfg))
+                    data = self._body()
+                    store.update_target(tid, clean_target(data, cfg))
+                    self._apply_image(tid, data)
                     monitor.sync_targets()
                     return self._json(200, {"ok": True})
                 return self._json(404, {"error": "Такого маршрута нет"})
@@ -1103,6 +1198,31 @@ def make_handler(monitor: Monitor):
                 return self._json(404, {"error": "Такого маршрута нет"})
             except Invalid as e:
                 return self._json(400, {"error": str(e)})
+
+        def _serve_image(self, tid: int) -> None:
+            found = store.image(tid)
+            if not found:
+                return self._json(404, {"error": "У цели нет изображения"})
+            blob, ctype = found
+            etag = '"%s"' % hashlib.sha256(blob).hexdigest()[:24]
+            if self.headers.get("If-None-Match") == etag:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            # Дашборд перерисовывается каждые 15 секунд — картинку он должен
+            # брать из кэша, а не тащить заново.
+            self._send(200, blob, ctype,
+                       extra={"ETag": etag, "Cache-Control": "private, max-age=300"})
+
+        def _apply_image(self, tid: int, data: dict[str, Any]) -> None:
+            raw = data.get("image")
+            if raw:
+                blob, ctype = parse_image(raw)
+                store.set_image(tid, blob, ctype)
+            elif data.get("image_clear"):
+                store.clear_image(tid)
 
         def _target_id(self, path: str) -> int:
             try:
