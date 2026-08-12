@@ -1018,7 +1018,10 @@ def make_handler(monitor: Monitor):
             if length <= 0:
                 return {}
             if length > MAX_BODY:
-                raise Invalid("Слишком большой запрос")
+                # Называем оба числа: чаще всего предел оказывается меньше
+                # ожидаемого потому, что onionwatch.py на сервере старее страниц.
+                raise Invalid(f"Запрос на {length // 1024} КБ не принят, "
+                              f"предел этой версии — {MAX_BODY // 1024} КБ")
             try:
                 data = json.loads(self.rfile.read(length).decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError) as e:
