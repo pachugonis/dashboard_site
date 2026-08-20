@@ -3,7 +3,7 @@
 Проверяет проверки, публичное API, админку (вход, CRUD целей, защиту
 маршрутов) и валидацию адресов. Сеть Tor и настоящие onion-сервисы не нужны.
 """
-import asyncio, base64, http.cookiejar, json, os, struct, sys, tempfile, threading, time
+import asyncio, base64, http.cookiejar, json, os, sqlite3, struct, sys, tempfile, threading, time
 import urllib.error, urllib.request, zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import onionwatch as ow
@@ -13,6 +13,8 @@ FAIL = "b" * 56 + ".onion"
 LOGIN, PASSWORD = "admin", "correct-horse-battery"
 
 fails: list[str] = []
+SEEN: list[bytes] = []              # заголовки запросов, дошедших до сервиса
+AUTH: list[tuple[str, str]] = []    # SOCKS-авторизация: она же выбор цепочки
 
 
 def check(label: str, got, want) -> None:
@@ -25,13 +27,20 @@ def check(label: str, got, want) -> None:
 # -- поддельная инфраструктура ---------------------------------------------
 
 async def http_backend(reader, writer):
+    head = b""
     try:
-        await reader.readuntil(b"\r\n\r\n")
+        head = await reader.readuntil(b"\r\n\r\n")
     except Exception:
         pass
-    body = b"<html><title>hello onion</title></html>"
-    writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
-                 % (len(body), body))
+    SEEN.append(head)
+    parts = head.split(b" ")
+    body, extra = b"<html><title>hello onion</title></html>", b""
+    # На /gz отвечаем сжатым телом: раз проверки просят gzip, как браузер,
+    # они обязаны его разжимать — иначе expect_text перестанет находиться.
+    if len(parts) > 1 and parts[1] == b"/gz" and b"gzip" in head.lower():
+        body, extra = zlib.compress(body, wbits=31), b"Content-Encoding: gzip\r\n"
+    writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n%sConnection: close\r\n\r\n%s"
+                 % (len(body), extra, body))
     try:
         await writer.drain()
     except Exception:
@@ -47,8 +56,9 @@ def make_socks(backend_port):
             if 0x02 in methods:
                 writer.write(b"\x05\x02"); await writer.drain()
                 await reader.readexactly(1)
-                ul = (await reader.readexactly(1))[0]; await reader.readexactly(ul)
-                pl = (await reader.readexactly(1))[0]; await reader.readexactly(pl)
+                ul = (await reader.readexactly(1))[0]; user = await reader.readexactly(ul)
+                pl = (await reader.readexactly(1))[0]; password = await reader.readexactly(pl)
+                AUTH.append((user.decode(), password.decode()))
                 writer.write(b"\x01\x00"); await writer.drain()
             else:
                 writer.write(b"\x05\x00"); await writer.drain()
@@ -154,8 +164,9 @@ async def main() -> int:
     sport = socks.sockets[0].getsockname()[1]
 
     tmp = tempfile.mkdtemp(prefix="onionwatch-selftest-")
+    # retry_delay почти нулевой: сами ретраи проверить надо, ждать между ними — нет.
     cfg = ow.Config(tor_socks=("127.0.0.1", sport), db_path=os.path.join(tmp, "t.db"),
-                    timeout=10, interval=300)
+                    timeout=10, interval=300, retry_delay=0.01)
     store = ow.Store(cfg.db_path)
 
     for spec in [
@@ -164,6 +175,7 @@ async def main() -> int:
         {"name": "wrong-status", "url": f"http://{GOOD}/", "expect_status": "404", "timeout": 10},
         {"name": "unreachable", "url": f"http://{FAIL}/", "timeout": 10},
         {"name": "tcp", "url": f"tcp://{GOOD}:1234", "mode": "tcp", "timeout": 10},
+        {"name": "gzip", "url": f"http://{GOOD}/gz", "expect_text": "hello onion", "timeout": 10},
     ]:
         store.add_target(ow.clean_target(spec, cfg))
 
@@ -175,9 +187,38 @@ async def main() -> int:
         await mon.run_check(t)
         await mon.run_check(t)
     for name, want in {"ok": True, "wrong-text": False, "wrong-status": False,
-                       "unreachable": False, "tcp": True}.items():
+                       "unreachable": False, "tcp": True, "gzip": True}.items():
         check(f"{name} доступен", mon.last[name]["ok"], want)
     check("причина сбоя разобрана", mon.last["unreachable"]["error_slug"], "descriptor_not_found")
+
+    print("\n1a. Попытки, цепочки и заголовки")
+    check("сбой цепочки не сразу даёт вердикт",
+          mon.last["unreachable"]["attempts"], cfg.attempts)
+    check("несовпадение текста повторять незачем", mon.last["wrong-text"]["attempts"], 1)
+    check("чужой код ответа повторять незачем", mon.last["wrong-status"]["attempts"], 1)
+    check("успех достаётся с первой попытки", mon.last["ok"]["attempts"], 1)
+
+    alive = [password for user, password in AUTH if user == "ow-ok"]
+    check("живая цель ходит по одной цепочке", (len(alive), len(set(alive))), (2, 1))
+    dead = [password for user, password in AUTH if user == "ow-unreachable"]
+    check("после сбоя цепочка берётся новая",
+          (len(dead), len(set(dead))), (2 * cfg.attempts, 2 * cfg.attempts))
+
+    first = SEEN[0].decode("latin-1").lower()
+    check("проверка представляется браузером", "firefox/" in first, True)
+    check("шлётся Accept-Language", "accept-language:" in first, True)
+    check("шлётся Accept-Encoding", "accept-encoding:" in first, True)
+    check("наш служебный User-Agent наружу не уходит", "onionwatch/" in first, False)
+
+    print("\n1б. Три состояния")
+    for name, want in {"ok": "up", "tcp": "up", "gzip": "up", "wrong-text": "warn",
+                       "wrong-status": "warn", "unreachable": "down"}.items():
+        check(f"{name}: состояние", mon.last[name]["state"], want)
+    # Ответ не тем, чего ждали, — не падение: сервис на связи, и аптайм это видит.
+    check("оговорка не роняет аптайм", store.summary("wrong-text", 3600)["uptime"], 100.0)
+    check("оговорки посчитаны отдельно", store.summary("wrong-text", 3600)["warn"], 2)
+    check("недоступность остаётся недоступностью",
+          store.summary("unreachable", 3600)["uptime"], 0.0)
 
     httpd = ow.ThreadingHTTPServer(("127.0.0.1", 0), ow.make_handler(mon))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -186,7 +227,8 @@ async def main() -> int:
     print("\n2. Публичное API и дашборд")
     code, state = api("GET", "/api/state")
     check("/api/state отвечает", code, 200)
-    check("сводка up/total", (state["up"], state["total"]), (2, 5))
+    check("сводка по состояниям",
+          (state["up"], state["warn"], state["down"], state["total"]), (3, 2, 1, 6))
     check("история пишется", len(state["targets"][0]["history"]), 2)
     check("страница дашборда отдаётся", api("GET", "/")[0], 200)
 
@@ -223,7 +265,7 @@ async def main() -> int:
     check("выключенная цель ушла из планировщика",
           (mon.sync_targets(), "новая-2" in mon.targets)[1], False)
     check("удаление цели", api("DELETE", f"/api/admin/targets/{tid}")[0], 200)
-    check("после удаления её нет", len(api("GET", "/api/admin/targets")[1]["targets"]), 5)
+    check("после удаления её нет", len(api("GET", "/api/admin/targets")[1]["targets"]), 6)
 
     print("\n6. Валидация адресов")
     for label, url in [("кириллица в адресе", "http://ВАШ-АДРЕС-1.onion/"),
@@ -323,6 +365,26 @@ async def main() -> int:
           api("POST", "/api/admin/password", {"current": PASSWORD, "password": "abc"})[0], 400)
     check("выход", api("POST", "/api/logout")[0], 200)
     check("после выхода админка закрыта", api("GET", "/api/admin/targets")[0], 401)
+
+    print("\n10. Миграция базы, созданной до третьего состояния")
+    # Без переноса старых записей аптайм за неделю считался бы по половине
+    # колонки: у них state пуст, а SUM его пропускает.
+    old_path = os.path.join(tmp, "old.db")
+    old = sqlite3.connect(old_path)
+    old.executescript("""
+        CREATE TABLE checks (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL,
+          ts REAL NOT NULL, ok INTEGER NOT NULL, phase TEXT, status INTEGER,
+          connect_ms REAL, ttfb_ms REAL, total_ms REAL, error_slug TEXT, error TEXT);
+        INSERT INTO checks (target, ts, ok) VALUES ('старая', 1000000000, 1),
+                                                   ('старая', 1000000001, 0);
+    """)
+    old.commit(); old.close()
+    migrated = ow.Store(old_path)
+    check("старые записи разнесены по трём состояниям",
+          [r["state"] for r in migrated.history("старая")], ["up", "down"])
+    check("аптайм по старой истории считается", migrated.summary("старая", 10 ** 12)["uptime"], 50.0)
+    check("число попыток у старых записей неизвестно",
+          migrated.history("старая")[0]["attempts"], None)
 
     httpd.shutdown()
     print("\nПровалов:", len(fails) or "нет", *(f"\n  - {f}" for f in fails))

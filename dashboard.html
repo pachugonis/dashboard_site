@@ -62,6 +62,7 @@
   .kpi .k { font-family: var(--mono); font-size: 10px; letter-spacing: .14em;
     text-transform: uppercase; color: var(--dim); margin-top: 4px; }
   .kpi.ok .v { color: var(--up); } .kpi.bad .v { color: var(--down); }
+  .kpi.warn .v { color: var(--slow); }
   .kpi.wait .v { color: var(--muted); }
 
   .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 18px 0 16px; }
@@ -84,6 +85,7 @@
     border-top: 3px solid var(--dim); border-radius: 12px; padding: 16px 18px 14px;
     display: flex; flex-direction: column; gap: 12px; min-width: 0; }
   .card.up { border-top-color: var(--up); }
+  .card.warn { border-top-color: var(--slow); }
   .card.down { border-top-color: var(--down); }
   .card.pending { border-top-color: var(--dim); }
 
@@ -102,6 +104,7 @@
     text-transform: uppercase; padding: 3px 7px; border-radius: 5px;
     border: 1px solid currentColor; white-space: nowrap; flex: none; }
   .up .pill { color: var(--up); } .down .pill { color: var(--down); }
+  .warn .pill { color: var(--slow); }
   .pending .pill { color: var(--dim); }
 
   .figures { display: flex; align-items: baseline; gap: 18px; }
@@ -122,6 +125,9 @@
   .tick i { display: block; border-radius: 2px 2px 0 0; }
   .tick .svc { background: var(--svc); margin-bottom: 2px; border-radius: 2px; }
   .tick .cir { background: var(--circuit); }
+  /* Ответ с оговоркой: цепочка построена и время ответа настоящее, поэтому
+     штрих остаётся обычным — жёлтой становится верхняя часть, а не весь он. */
+  .tick.warn .svc { background: var(--slow); }
   .tick.bad i { background: var(--down); border-radius: 2px 2px 0 0; }
   .tick.empty i { background: var(--line); }
   .legend { font-family: var(--mono); font-size: 10px; color: var(--dim);
@@ -132,6 +138,7 @@
     margin-right: 4px; vertical-align: 0; }
 
   .err { font-size: 12.5px; color: var(--down); }
+  .caveat { font-size: 12.5px; color: var(--slow); }
   .note { font-size: 12.5px; color: var(--dim); }
   .foot-row { display: flex; align-items: center; justify-content: space-between;
     gap: 10px; margin-top: auto; padding-top: 4px; }
@@ -167,7 +174,7 @@
 
   <div class="controls">
     <input type="search" id="filter" placeholder="фильтр по имени или адресу" aria-label="Фильтр">
-    <button class="btn" id="only-down" aria-pressed="false">Только недоступные</button>
+    <button class="btn" id="only-bad" aria-pressed="false">Только проблемные</button>
     <button class="btn" id="refresh">Обновить</button>
     <button class="btn" id="auto" aria-pressed="true">Автообновление: вкл</button>
     <a class="btn" href="/admin">Админка</a>
@@ -181,7 +188,7 @@
 
 <script>
 const REFRESH_MS = 15000;
-let state = null, auto = true, onlyDown = false, timer = null;
+let state = null, auto = true, onlyBad = false, timer = null;
 
 const el = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -197,18 +204,27 @@ const ago = ts => {
 };
 const clock = ts => new Date(ts*1000).toLocaleTimeString("ru-RU");
 const grade = v => v == null ? "none" : v >= 99 ? "good" : v >= 95 ? "warn" : "bad";
+// Три состояния: сервис ответил как ждали, ответил не тем, или не ответил
+// вовсе. У записей, сделанных до появления третьего, поля state нет.
+const stateOf = h => h.state || (h.ok ? "up" : "down");
+const WORD = { up: "доступен", warn: "с оговоркой", down: "недоступен", pending: "в очереди" };
 
 function tape(history) {
   const slots = 60;
   const pad = Array(Math.max(0, slots - history.length)).fill(null);
   const items = pad.concat(history.slice(-slots));
-  const worst = Math.max(1000, ...history.filter(h => h.ok).map(h => h.ttfb_ms || h.connect_ms || 0));
+  const alive = history.filter(h => stateOf(h) !== "down");
+  const worst = Math.max(1000, ...alive.map(h => h.ttfb_ms || h.connect_ms || 0));
   return items.map(h => {
     if (!h) return '<span class="tick empty" aria-hidden="true"><i style="height:2px"></i></span>';
     const when = clock(h.ts);
-    if (!h.ok) {
+    // Сколько попыток стоило за этой отметкой: одна — обычное дело и молчим,
+    // несколько — видно, что цель на грани, даже когда полоска зелёная.
+    const tries = (h.attempts || 1) > 1 ? ` · попыток: ${h.attempts}` : "";
+    const st = stateOf(h);
+    if (st === "down") {
       const why = h.error || h.error_slug || "недоступен";
-      return `<span class="tick bad" title="${esc(when)} — сбой: ${esc(why)}"><i style="height:100%"></i></span>`;
+      return `<span class="tick bad" title="${esc(when + " — сбой: " + why + tries)}"><i style="height:100%"></i></span>`;
     }
     const circuit = h.connect_ms || 0;
     const scale = v => Math.max(2, Math.min(100, Math.round(100 * v / worst)));
@@ -216,11 +232,17 @@ function tape(history) {
     // В режиме tcp ответа нет вообще (ttfb_ms пуст) — рисуем только цепочку,
     // иначе зелёная полоска обозначала бы несуществующее время ответа.
     const svc = h.ttfb_ms == null ? null : Math.max(0, h.ttfb_ms - circuit);
-    const hs = svc ? Math.min(100 - hc, scale(svc)) : 0;
-    const tip = svc == null
-      ? `${when} — поток открыт · цепочка ${ms(circuit)}`
-      : `${when} — HTTP ${h.status ?? "ok"} · цепочка ${ms(circuit)} · ответ ${ms(svc)}`;
-    return `<span class="tick" title="${esc(tip)}">`
+    let hs = svc ? Math.min(100 - hc, scale(svc)) : 0;
+    // Оговорку видно и при мгновенном ответе: иначе жёлтой части не осталось бы.
+    if (st === "warn") hs = Math.max(hs, 3);
+    // У оговорки вместо кода ответа пишем причину: она его и называет, а когда
+    // дело в теле ответа — код сам по себе ничего не объясняет.
+    const lead = st === "warn" ? (h.error || "ответ не тот, которого ждали")
+      : svc == null ? "поток открыт" : `HTTP ${h.status ?? "ok"}`;
+    const timings = svc == null ? `цепочка ${ms(circuit)}`
+      : `цепочка ${ms(circuit)} · ответ ${ms(svc)}`;
+    const tip = `${when} — ${lead} · ${timings}${tries}`;
+    return `<span class="tick ${st}" title="${esc(tip)}">`
          + (hs ? `<i class="svc" style="height:${hs}%"></i>` : "")
          + `<i class="cir" style="height:${hc}%"></i></span>`;
   }).join("");
@@ -228,11 +250,15 @@ function tape(history) {
 
 function card(t) {
   const last = t.last;
-  const status = !last ? "pending" : (last.ok ? "up" : "down");
-  const word = status === "up" ? "доступен" : status === "down" ? "недоступен" : "в очереди";
+  const status = !last ? "pending" : stateOf(last);
+  const word = WORD[status];
   const d = t.day, w = t.week;
-  const detail = last && !last.ok
-    ? `<div class="err">${esc(last.error || "недоступен")}</div>` : "";
+  // Оговорка — это «сервис на связи, но отдал не то»: причина та же, что у
+  // сбоя, а вес другой, поэтому и цвет другой, и формулировка не про падение.
+  const detail = !last || status === "up" ? ""
+    : status === "warn"
+      ? `<div class="caveat">Сервис на связи · ${esc(last.error || "ответ не тот, которого ждали")}</div>`
+      : `<div class="err">${esc(last.error || "недоступен")}</div>`;
   const note = t.note ? `<div class="note">${esc(t.note)}</div>` : "";
   const port = (t.port !== 80 && t.port !== 443) ? ":" + t.port : "";
   return `<article class="card ${status}" data-name="${esc(t.name)}">
@@ -267,7 +293,7 @@ function card(t) {
       <div class="legend">
         <span><span class="sw" style="background:var(--circuit)"></span>цепочка <b>${ms(d.avg_circuit_ms)}</b></span>
         <span><span class="sw" style="background:var(--svc)"></span>ответ <b>${ms(d.avg_ttfb_ms)}</b></span>
-        <span>${d.checks} проверок</span>
+        <span>${d.checks} проверок${d.warn ? ` · ${d.warn} с оговоркой` : ""}</span>
       </div>
     </div>
 
@@ -285,7 +311,8 @@ function render() {
   const q = el("filter").value.trim().toLowerCase();
   let list = state.targets;
   if (q) list = list.filter(t => (t.name + " " + t.host).toLowerCase().includes(q));
-  if (onlyDown) list = list.filter(t => t.last && !t.last.ok);
+  // Оговорка — тоже повод посмотреть на цель, поэтому фильтр ловит и её.
+  if (onlyBad) list = list.filter(t => t.last && stateOf(t.last) !== "up");
 
   el("meta").innerHTML =
     `<span><span class="dot ${state.tor_ok ? "on" : "off"}"></span>tor ${esc(state.tor_socks)}</span>`
@@ -293,6 +320,7 @@ function render() {
 
   el("kpis").innerHTML = state.total ? [
     `<div class="kpi ok"><div class="v">${state.up}</div><div class="k">доступно</div></div>`,
+    `<div class="kpi warn"><div class="v">${state.warn ?? 0}</div><div class="k">с оговоркой</div></div>`,
     `<div class="kpi bad"><div class="v">${state.down}</div><div class="k">недоступно</div></div>`,
     `<div class="kpi wait"><div class="v">${state.pending}</div><div class="k">ещё не проверялись</div></div>`,
   ].join("") : "";
@@ -340,9 +368,9 @@ el("list").addEventListener("click", async ev => {
 });
 el("filter").addEventListener("input", render);
 el("refresh").addEventListener("click", load);
-el("only-down").addEventListener("click", ev => {
-  onlyDown = !onlyDown;
-  ev.currentTarget.setAttribute("aria-pressed", String(onlyDown));
+el("only-bad").addEventListener("click", ev => {
+  onlyBad = !onlyBad;
+  ev.currentTarget.setAttribute("aria-pressed", String(onlyBad));
   render();
 });
 el("auto").addEventListener("click", ev => {

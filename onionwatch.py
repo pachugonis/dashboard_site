@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import base64
 import binascii
+import contextlib
 import getpass
 import hashlib
 import hmac
@@ -34,12 +35,46 @@ import sys
 import threading
 import time
 import urllib.parse
+import zlib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-UA = "onionwatch/2.0"
+UA = "onionwatch/2.0"          # чем представляется наш собственный веб-сервер
+
+# Чем представляются исходящие проверки. Перед живыми onion-ресурсами почти
+# всегда стоит анти-DDoS (EndGame и его клоны), который отвечает 403 или капчей
+# всему, что не похоже на Tor Browser: отсутствия Accept-Language уже хватает,
+# чтобы посчитать клиента ботом. Отсюда и типовая картинка «в браузере сайт
+# открывается, а монитор красный».
+#
+# Версию стоит обновлять вслед за Tor Browser: у всех его пользователей она
+# одинаковая, поэтому отставшая на пару лет строка снова делает нас заметными.
+TOR_BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; rv:140.0) Gecko/20100101 Firefox/140.0"
+BROWSER_HEADERS = (
+    # Ровно тот набор и порядок, что шлёт Tor Browser при переходе по ссылке.
+    ("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+    ("Accept-Language", "en-US,en;q=0.5"),
+    ("Accept-Encoding", "gzip, deflate"),
+    ("Upgrade-Insecure-Requests", "1"),
+    ("Sec-Fetch-Dest", "document"),
+    ("Sec-Fetch-Mode", "navigate"),
+    ("Sec-Fetch-Site", "none"),
+    ("Sec-Fetch-User", "?1"),
+)
+
+# Сбои, которые бывают разовыми: цепочка не собралась, HSDir не ответил,
+# сервис придержал нас под нагрузкой. Их имеет смысл повторить. Ответы вроде
+# «клиентская авторизация отклонена» повторять незачем — они не изменятся.
+RETRY_SLUGS = frozenset({
+    "timeout", "connection", "socks_error", "general_failure",
+    "net_unreachable", "host_unreachable", "ttl_expired",
+    "descriptor_not_found", "intro_failed", "intro_timeout", "rendezvous_failed",
+})
+# Коды, которыми анти-DDoS отвечает под нагрузкой или на первый запрос без
+# cookie: сервис жив, нас просто придержали. Стабильные 404 и 410 не повторяем.
+RETRY_STATUS = frozenset({403, 429, 500, 502, 503, 504})
 
 # Коды ответа SOCKS5: стандартные (RFC 1928) + расширения Tor (prop304).
 # Расширенные коды 0xF0–0xF7 Tor присылает, только если в torrc у SocksPort
@@ -152,6 +187,10 @@ class Config:
     concurrency: int = 6
     retention_days: int = 30
     isolate_circuits: bool = True
+    attempts: int = 3                # попыток до вердикта «недоступен»
+    retry_delay: float = 20.0        # пауза между попытками
+    circuit_ttl: float = 1800.0      # сколько держимся за одну цепочку на цель
+    user_agent: str = TOR_BROWSER_UA
     require_login: bool = False      # закрыть логином и сам дашборд, не только админку
     session_hours: int = 12
     seed_targets: list[dict[str, Any]] = field(default_factory=list)
@@ -177,6 +216,10 @@ def load_config(path: str) -> Config:
     cfg.concurrency = int(raw.get("concurrency", cfg.concurrency))
     cfg.retention_days = int(raw.get("retention_days", cfg.retention_days))
     cfg.isolate_circuits = bool(raw.get("isolate_circuits", True))
+    cfg.attempts = max(1, min(10, int(raw.get("attempts", cfg.attempts))))
+    cfg.retry_delay = max(0.0, float(raw.get("retry_delay", cfg.retry_delay)))
+    cfg.circuit_ttl = max(0.0, float(raw.get("circuit_ttl", cfg.circuit_ttl)))
+    cfg.user_agent = str(raw.get("user_agent") or cfg.user_agent)
     cfg.require_login = bool(raw.get("require_login", False))
     cfg.session_hours = int(raw.get("session_hours", cfg.session_hours))
     # targets в конфиге больше не нужны: они живут в базе и заводятся в админке.
@@ -389,22 +432,100 @@ def _tls_context() -> ssl.SSLContext:
     return ctx
 
 
+class Circuits:
+    """Пароль в SOCKS-авторизации выбирает цепочку.
+
+    При IsolateSOCKSAuth (включён у Tor по умолчанию) Tor держит отдельную
+    цепочку на каждую пару логин/пароль. Случайный пароль на каждую проверку
+    означал бы шесть новых узлов и новый rendezvous каждые пять минут — самую
+    медленную и хрупкую операцию в Tor. Постоянная строка на цель даёт то же,
+    что открытая вкладка браузера: проверки идут по уже построенной цепочке.
+
+    Сколько цепочка живёт на самом деле, решает Tor: после MaxCircuitDirtiness
+    (по умолчанию 10 минут) он выдаст новую даже под тем же паролем. Поэтому
+    circuit_ttl задаёт лишь верхнюю границу, а не гарантию.
+    """
+
+    def __init__(self, ttl: float):
+        self.ttl = ttl
+        self._creds: dict[str, tuple[str, float]] = {}
+
+    def password(self, name: str) -> str:
+        password, born = self._creds.get(name, ("", 0.0))
+        if not password or time.time() - born >= self.ttl:
+            password = secrets.token_hex(8)
+            self._creds[name] = (password, time.time())
+        return password
+
+    def drop(self, name: str) -> None:
+        """Цепочка подвела или цель изменилась — следующая проверка возьмёт новую."""
+        self._creds.pop(name, None)
+
+
+def _header(head: bytes, name: str) -> str:
+    """Значение заголовка из уже прочитанного блока, приведённое к нижнему регистру."""
+    want = name.encode().lower()
+    for line in head.split(b"\r\n")[1:]:
+        key, sep, value = line.partition(b":")
+        if sep and key.strip().lower() == want:
+            return value.strip().decode("latin-1").lower()
+    return ""
+
+
+class Unpack:
+    """Разжимает тело ответа по кускам.
+
+    Раз мы просим gzip, как браузер, — обязаны его понимать, иначе expect_text
+    перестанет находиться. Распаковка потоковая: строку ищем на лету, не
+    дожидаясь конца передачи.
+    """
+
+    def __init__(self, encoding: str):
+        self.encoding = encoding
+        self.started = False
+        if encoding == "gzip":
+            self.dec: Any = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        elif encoding == "deflate":
+            self.dec = zlib.decompressobj(zlib.MAX_WBITS)
+        else:
+            self.dec = None
+
+    def __call__(self, chunk: bytes) -> bytes:
+        if self.dec is None:
+            return chunk
+        try:
+            out = self.dec.decompress(chunk)
+        except zlib.error as e:
+            if self.started or self.encoding != "deflate":
+                raise ValueError(f"ответ не разжимается ({self.encoding})") from e
+            # Часть серверов шлёт deflate «как есть», без zlib-заголовка.
+            self.dec = zlib.decompressobj(-zlib.MAX_WBITS)
+            try:
+                out = self.dec.decompress(chunk)
+            except zlib.error as e2:
+                raise ValueError("ответ не разжимается (deflate)") from e2
+        self.started = True
+        return out
+
+
 # --------------------------------------------------------------------------
 # Проверка одной цели
 # --------------------------------------------------------------------------
 
-async def check_target(cfg: Config, t: Target) -> dict[str, Any]:
+async def check_target(cfg: Config, t: Target, circuits: Circuits | None = None) -> dict[str, Any]:
     """Возвращает результат проверки: ok, фаза сбоя, коды и тайминги."""
     res: dict[str, Any] = {
         "target": t.name, "ts": time.time(), "ok": False, "phase": "circuit",
         "status": None, "connect_ms": None, "ttfb_ms": None, "total_ms": None,
-        "error": None, "error_slug": None,
+        "error": None, "error_slug": None, "attempts": 1,
     }
     creds: tuple[str | None, str | None] = (None, None)
     if cfg.isolate_circuits:
-        # Отдельная цепочка на каждую проверку (Tor IsolateSOCKSAuth):
-        # зависший сервис не тянет за собой остальные.
-        creds = (f"ow-{t.name}", secrets.token_hex(8))
+        # Отдельная цепочка на каждую цель (Tor IsolateSOCKSAuth): зависший
+        # сервис не тянет за собой остальные. Пароль постоянный в пределах
+        # circuit_ttl — иначе каждая проверка строила бы цепочку заново.
+        password = circuits.password(t.name) if circuits else secrets.token_hex(8)
+        creds = (f"ow-{t.name}", password)
 
     t0 = time.perf_counter()
     writer = None
@@ -424,11 +545,14 @@ async def check_target(cfg: Config, t: Target) -> dict[str, Any]:
                     writer.start_tls(_tls_context(), server_hostname=t.host),
                     timeout=max(1.0, deadline - time.perf_counter()),
                 )
-            req = (
-                f"GET {t.path} HTTP/1.1\r\nHost: {t.host}\r\n"
-                f"User-Agent: {UA}\r\nAccept: */*\r\nConnection: close\r\n\r\n"
-            ).encode()
-            writer.write(req)
+            # Порт в Host опускаем только если он совпадает со схемой:
+            # браузер поступает так же, а строгий вход по имени иначе ответит 404.
+            authority = t.host if t.port == (443 if t.tls else 80) else f"{t.host}:{t.port}"
+            lines = [f"GET {t.path} HTTP/1.1", f"Host: {authority}",
+                     f"User-Agent: {cfg.user_agent}"]
+            lines += [f"{k}: {v}" for k, v in BROWSER_HEADERS]
+            lines.append("Connection: close")
+            writer.write(("\r\n".join(lines) + "\r\n\r\n").encode())
             await writer.drain()
 
             res["phase"] = "response"
@@ -445,17 +569,20 @@ async def check_target(cfg: Config, t: Target) -> dict[str, Any]:
             ok = res["status"] in t.expect_status
             if ok and t.expect_text:
                 res["phase"] = "body"
-                body = b""
-                while len(body) < 256 * 1024:
+                needle = t.expect_text.encode()
+                unpack = Unpack(_header(head, "Content-Encoding"))
+                body, raw = b"", 0
+                while raw < 256 * 1024 and len(body) < 4 * 1024 * 1024:
                     chunk = await asyncio.wait_for(
                         reader.read(16384), timeout=max(1.0, deadline - time.perf_counter())
                     )
                     if not chunk:
                         break
-                    body += chunk
-                    if t.expect_text.encode() in body:
+                    raw += len(chunk)
+                    body += unpack(chunk)
+                    if needle in body:
                         break
-                if t.expect_text.encode() not in body:
+                if needle not in body:
                     ok = False
                     res["error_slug"] = "text_missing"
                     res["error"] = f"В ответе нет строки {t.expect_text!r}"
@@ -487,7 +614,49 @@ async def check_target(cfg: Config, t: Target) -> dict[str, Any]:
             except Exception:
                 pass
 
+    # Третье состояние. Если сервис ответил по HTTP — он на связи, каким бы код
+    # ни был: за onion-ресурсами обычно стоит анти-DDoS, и 403 с капчей значит
+    # «работает, но не пускает нас», а не «выключен». Красным остаётся только
+    # то, до чего мы не достучались: цепочка, таймаут до ответа, мёртвый tor.
+    res["state"] = "up" if res["ok"] else ("warn" if res["status"] is not None else "down")
     res["total_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    return res
+
+
+def retryable(res: dict[str, Any]) -> bool:
+    """Стоит ли повторить проверку, или ответ уже окончательный."""
+    if res["error_slug"] in RETRY_SLUGS:
+        return True
+    return res["error_slug"] == "bad_status" and res["status"] in RETRY_STATUS
+
+
+async def check_with_retry(cfg: Config, t: Target, circuits: Circuits | None = None,
+                           sem: asyncio.Semaphore | None = None) -> dict[str, Any]:
+    """Помечает цель недоступной только после нескольких неудачных попыток.
+
+    Одна проверка через Tor срывается и на совершенно живом сервисе: цепочка
+    не собралась, дескриптор не нашёлся, анти-DDoS придержал под нагрузкой.
+    Ретрай отделяет такой разовый сбой от настоящей недоступности — иначе
+    моргнувшая цепочка красит цель в красное до следующего цикла.
+
+    Семафор берём на каждую попытку отдельно: держать его во время паузы
+    значило бы занимать место в очереди, ничего не делая.
+    """
+    guard: Any = sem if sem is not None else contextlib.nullcontext()
+    total = max(1, cfg.attempts)
+    res: dict[str, Any] = {}
+    for attempt in range(1, total + 1):
+        async with guard:
+            res = await check_target(cfg, t, circuits)
+        res["attempts"] = attempt
+        if res["ok"]:
+            break
+        again = retryable(res)
+        if again and circuits is not None:
+            circuits.drop(t.name)     # подвела цепочка — следующая попытка берёт новую
+        if not again or attempt == total:
+            break
+        await asyncio.sleep(cfg.retry_delay)
     return res
 
 
@@ -516,7 +685,9 @@ class Store:
                     ttfb_ms REAL,
                     total_ms REAL,
                     error_slug TEXT,
-                    error TEXT
+                    error TEXT,
+                    attempts INTEGER,
+                    state TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_checks_target_ts ON checks(target, ts DESC);
 
@@ -558,6 +729,16 @@ class Store:
             for column, decl in (("image", "BLOB"), ("image_type", "TEXT")):
                 if column not in have:
                     self.db.execute(f"ALTER TABLE targets ADD COLUMN {column} {decl}")
+            # Так же и с историей проверок: попытка была всегда одна, а состояний
+            # было два. Старые записи разносим по новой шкале — иначе аптайм за
+            # неделю считался бы по половине колонки.
+            have = {r["name"] for r in self.db.execute("PRAGMA table_info(checks)")}
+            for column, decl in (("attempts", "INTEGER"), ("state", "TEXT")):
+                if column not in have:
+                    self.db.execute(f"ALTER TABLE checks ADD COLUMN {column} {decl}")
+            if "state" not in have:
+                self.db.execute(
+                    "UPDATE checks SET state = CASE WHEN ok THEN 'up' ELSE 'down' END")
             self.db.commit()
 
     # -- проверки ----------------------------------------------------------
@@ -566,9 +747,11 @@ class Store:
         with self.lock:
             self.db.execute(
                 "INSERT INTO checks (target, ts, ok, phase, status, connect_ms, ttfb_ms,"
-                " total_ms, error_slug, error) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                " total_ms, error_slug, error, attempts, state)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (r["target"], r["ts"], int(r["ok"]), r["phase"], r["status"], r["connect_ms"],
-                 r["ttfb_ms"], r["total_ms"], r["error_slug"], r["error"]),
+                 r["ttfb_ms"], r["total_ms"], r["error_slug"], r["error"],
+                 r.get("attempts", 1), r.get("state") or ("up" if r["ok"] else "down")),
             )
             self.db.commit()
 
@@ -583,7 +766,7 @@ class Store:
     def history(self, target: str, limit: int = 60) -> list[dict[str, Any]]:
         with self.lock:
             rows = self.db.execute(
-                "SELECT ts, ok, status, connect_ms, ttfb_ms, error_slug, error"
+                "SELECT ts, ok, state, status, connect_ms, ttfb_ms, error_slug, error, attempts"
                 " FROM checks WHERE target=? ORDER BY ts DESC LIMIT ?", (target, limit)
             ).fetchall()
         return [dict(r) for r in reversed(rows)]
@@ -591,16 +774,23 @@ class Store:
     def summary(self, target: str, window_s: float) -> dict[str, Any]:
         since = time.time() - window_s
         with self.lock:
+            # Аптайм — доля проверок, в которых сервис был на связи, поэтому
+            # ответы «с оговоркой» идут в него наравне с чистыми: они значат
+            # «работает, но отдаёт не то», а не «лежит». Сколько их было,
+            # возвращаем отдельным числом. Тайминги считаем по тем же проверкам:
+            # у ответа с оговоркой время ответа настоящее.
             row = self.db.execute(
-                "SELECT COUNT(*) n, SUM(ok) up, AVG(CASE WHEN ok THEN ttfb_ms END) ttfb,"
-                " AVG(CASE WHEN ok THEN connect_ms END) conn"
+                "SELECT COUNT(*) n, SUM(state<>'down') alive, SUM(state='warn') warn,"
+                " AVG(CASE WHEN state<>'down' THEN ttfb_ms END) ttfb,"
+                " AVG(CASE WHEN state<>'down' THEN connect_ms END) conn"
                 " FROM checks WHERE target=? AND ts>=?", (target, since)
             ).fetchone()
         n = row["n"] or 0
-        up = row["up"] or 0
+        alive = row["alive"] or 0
         return {
             "checks": n,
-            "uptime": round(100.0 * up / n, 2) if n else None,
+            "warn": row["warn"] or 0,
+            "uptime": round(100.0 * alive / n, 2) if n else None,
             "avg_ttfb_ms": round(row["ttfb"], 0) if row["ttfb"] else None,
             "avg_circuit_ms": round(row["conn"], 0) if row["conn"] else None,
         }
@@ -793,6 +983,7 @@ class Monitor:
         self.cfg = cfg
         self.store = store
         self.sem = asyncio.Semaphore(cfg.concurrency)
+        self.circuits = Circuits(cfg.circuit_ttl)
         self.loop: asyncio.AbstractEventLoop | None = None
         self.last: dict[str, dict[str, Any]] = {}
         self.running: set[str] = set()
@@ -814,12 +1005,14 @@ class Monitor:
             old = self.targets.get(name)
             if old is None or old.url != t.url or old.mode != t.mode:
                 self.due[name] = now      # новая или переписанная цель — проверяем сразу
+                self.circuits.drop(name)  # адрес другой, старая цепочка ни при чём
             elif name not in self.due:
                 self.due[name] = now
         for name in list(self.due):
             if name not in fresh:
                 self.due.pop(name, None)
                 self.last.pop(name, None)
+                self.circuits.drop(name)
         self.targets = fresh
 
     # -- прогон ------------------------------------------------------------
@@ -829,14 +1022,16 @@ class Monitor:
             return self.last.get(t.name, {})
         self.running.add(t.name)
         try:
-            async with self.sem:
-                res = await check_target(self.cfg, t)
+            res = await check_with_retry(self.cfg, t, self.circuits, self.sem)
         finally:
             self.running.discard(t.name)
         self.store.add(res)
         self.last[t.name] = res
-        mark = "UP  " if res["ok"] else "DOWN"
+        mark = {"up": "UP  ", "warn": "WARN", "down": "DOWN"}[res["state"]]
         detail = f"{res['status']}" if res["status"] else (res["error_slug"] or "")
+        tries = res.get("attempts", 1)
+        if tries > 1:
+            detail += f" · попыток: {tries}"
         print(f"[{time.strftime('%H:%M:%S')}] {mark} {t.name:<24} "
               f"{res['total_ms']:>7.0f} ms  {detail}", flush=True)
         return res
@@ -917,16 +1112,19 @@ class Monitor:
                 "week": self.store.summary(t.name, 7 * 86400),
                 "history": self.store.history(t.name, 60),
             })
-        up = sum(1 for x in out if x["last"] and x["last"].get("ok"))
-        pending = sum(1 for x in out if not x["last"])
+        # У записей, сделанных до появления третьего состояния, поля state нет.
+        marks = [("pending" if not x["last"] else
+                  x["last"].get("state") or ("up" if x["last"].get("ok") else "down"))
+                 for x in out]
         return {
             "generated_at": time.time(),
             "started_at": self.started_at,
             "tor_ok": self.tor_alive(),
             "tor_socks": f"{self.cfg.tor_socks[0]}:{self.cfg.tor_socks[1]}",
-            "up": up,
-            "down": len(out) - up - pending,
-            "pending": pending,
+            "up": marks.count("up"),
+            "warn": marks.count("warn"),
+            "down": marks.count("down"),
+            "pending": marks.count("pending"),
             "total": len(out),
             "targets": out,
         }
@@ -1273,11 +1471,16 @@ async def run_once(cfg: Config, store: Store) -> int:
         print("В базе нет ни одной включённой цели — заведите их в админке.", file=sys.stderr)
         return 2
     results = await asyncio.gather(*(monitor.run_check(t) for t in targets))
-    down = [r for r in results if not r["ok"]]
+    down = [r for r in results if r["state"] == "down"]
+    warn = [r for r in results if r["state"] == "warn"]
     print(f"\nДоступно {len(results) - len(down)} из {len(results)}")
+    for r in warn:
+        print(f"  ~ {r['target']}: на связи, но {r['error']}")
     for r in down:
         print(f"  ✗ {r['target']}: {r['error']}")
-    return 1 if down else 0
+    # Код выхода различает «не достучались» и «ответил не тем»: и то и другое
+    # не норма, но реагируют на них по-разному.
+    return 1 if down else (3 if warn else 0)
 
 
 def open_store(path: str) -> Store:

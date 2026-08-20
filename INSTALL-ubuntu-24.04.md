@@ -152,6 +152,14 @@ onionwatch отличает выключенный сервис (`descriptor_not
 цепочки (`rendezvous_failed`) и от запроса клиентского ключа
 (`client_auth_missing`).
 
+Необязательно, но полезно, если проверки часто срываются: onionwatch держится за
+одну цепочку на цель, чтобы не строить её заново каждые пять минут, однако Tor
+всё равно выдаёт новую после `MaxCircuitDirtiness` — по умолчанию 600 секунд.
+Строкой `MaxCircuitDirtiness 1800` в том же `torrc` цепочка живёт дольше и
+переиспользуется всеми проверками подряд, а не каждой второй. Обратная сторона —
+дольше один и тот же путь через сеть; для мониторинга это приемлемо, для анонимной
+работы в браузере — нет, поэтому отдельный `SocksPort` для onionwatch тут уместен.
+
 ---
 
 ## 3. Установка onionwatch
@@ -253,6 +261,10 @@ sudo nano /etc/onionwatch/config.json
   "concurrency": 6,
   "retention_days": 30,
   "isolate_circuits": true,
+
+  "attempts": 3,
+  "retry_delay": 20,
+  "circuit_ttl": 1800,
 
   "require_login": false,
   "session_hours": 12
@@ -481,7 +493,9 @@ sudo certbot --nginx -d status.example.com
 
 Дашборд удобно смотреть глазами, но о сбое лучше узнавать сразу. Скрипт ниже
 сравнивает текущее состояние с прошлым и шлёт сообщение только при изменениях —
-когда цель упала и когда вернулась.
+когда цель упала, когда сменила состояние и когда вернулась в норму. Состояний
+три, и в тексте они разведены: «не отвечает» и «отвечает не тем» требуют разной
+реакции (см. раздел «Три состояния» в `README.md`).
 
 ```bash
 sudo tee /usr/local/bin/onionwatch-alert >/dev/null <<'PY'
@@ -499,22 +513,34 @@ def notify(text):
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=15).read()
 
+WORD = {"down": "не отвечает", "warn": "отвечает не тем"}
+
 state = json.load(urllib.request.urlopen(API, timeout=15))
-down = {t["name"]: (t["last"] or {}).get("error", "нет данных")
-        for t in state["targets"] if not (t["last"] or {}).get("ok")}
+bad = {}
+for t in state["targets"]:
+    last = t["last"] or {}
+    if not last:
+        continue                       # ещё ни разу не проверялась
+    kind = last.get("state") or ("up" if last.get("ok") else "down")
+    if kind != "up":
+        bad[t["name"]] = [kind, last.get("error", "нет данных")]
+
 try:
-    prev = set(json.load(open(STATE)))
+    prev = dict(json.load(open(STATE)))
 except Exception:
-    prev = set()
+    prev = {}                          # первый запуск либо файл от старой версии
 
 host = socket.gethostname()
-if new := set(down) - prev:
-    notify(f"[{host}] недоступны: " + "; ".join(f"{n} — {down[n]}" for n in sorted(new)))
-if back := prev - set(down):
-    notify(f"[{host}] снова доступны: " + ", ".join(sorted(back)))
+# Пишем и когда цель стала нештатной, и когда сменила одно состояние на другое:
+# переход «отвечает не тем» → «не отвечает» важнее самого первого сообщения.
+if new := [n for n, (kind, _) in bad.items() if prev.get(n) != kind]:
+    notify(f"[{host}] " + "; ".join(f"{n} — {WORD[bad[n][0]]}: {bad[n][1]}"
+                                    for n in sorted(new)))
+if back := set(prev) - set(bad):
+    notify(f"[{host}] снова в порядке: " + ", ".join(sorted(back)))
 
 with open(STATE, "w") as fh:
-    json.dump(sorted(down), fh)
+    json.dump({n: kind for n, (kind, _) in bad.items()}, fh)
 PY
 sudo chmod 755 /usr/local/bin/onionwatch-alert
 ```
@@ -556,6 +582,11 @@ journalctl -u onionwatch-alert -n 20 --no-pager
 Без `OW_WEBHOOK` скрипт просто пишет в журнал — это уже даёт историю падений.
 Подойдёт любой вебхук, принимающий JSON с полем `text`; для Telegram проще
 сделать `notify()` через Bot API.
+
+Если оповещения об оговорках не нужны, оставьте в `bad` только `kind == "down"`.
+После обновления с версии без третьего состояния первый запуск пришлёт по одному
+сообщению на каждую нештатную цель: формат файла состояния изменился, и старый
+скрипт его не поймёт — это разовое.
 
 Одна тонкость: не поднимайте частоту оповещений выше интервала проверок —
 чаще, чем `check_interval`, состояние всё равно не меняется.
@@ -641,6 +672,10 @@ sudo systemctl daemon-reload
 | Onion-адрес не открывается в обычном браузере | зона `.onion` резолвится только через Tor — нужен Tor Browser |
 | `apt update` не видит репозиторий Tor | нет сборки под `noble` — временно поставьте пакет из universe |
 | Первые минуты все цели красные | это нормально: первая проверка каждой цели стартует со случайной задержкой, а цепочка строится 5–30 секунд |
+| Цель красная, а в Tor Browser открывается | красное значит «не достучались»: смотрите `error_slug` в логе. Если сервис отвечает, но не тем, цель будет жёлтой, а не красной. Разбор — в разделе «Ложная недоступность» в `README.md` |
+| Цель жёлтая, «с оговоркой» | сервис на связи, но отдаёт не то, чего ждёт цель: капча, страница анти-DDoS, переехавший адрес. Причина написана прямо в карточке; лечится ожидаемым кодом в настройках цели либо режимом `tcp` |
+| Цель то красная, то зелёная без причины | цепочки срываются. Поднимите `attempts` до 4–5 и `timeout` до 90–120 с; в подсказке на ленте видно, со скольких попыток цель отвечает |
+| Недоступные цели проверяются дольше интервала | каждая отрабатывает `attempts × timeout + (attempts − 1) × retry_delay`. Снизьте `attempts` или поднимите `check_interval` |
 
 ---
 
