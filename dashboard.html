@@ -140,6 +140,11 @@
   .err { font-size: 12.5px; color: var(--down); }
   .caveat { font-size: 12.5px; color: var(--slow); }
   .note { font-size: 12.5px; color: var(--dim); }
+  /* Ссылка из Location — один сплошной токен: переносить её не по чему, и
+     карточку распирает. Onion-адрес внутри сокращается в коде, а остаток
+     режется по ширине; целиком строка видна в подсказке. */
+  .redirect { font-size: 12.5px; color: var(--dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .foot-row { display: flex; align-items: center; justify-content: space-between;
     gap: 10px; margin-top: auto; padding-top: 4px; }
   .when { font-family: var(--mono); font-size: 11px; color: var(--dim); }
@@ -208,6 +213,11 @@ const grade = v => v == null ? "none" : v >= 99 ? "good" : v >= 95 ? "warn" : "b
 // вовсе. У записей, сделанных до появления третьего, поля state нет.
 const stateOf = h => h.state || (h.ok ? "up" : "down");
 const WORD = { up: "доступен", warn: "с оговоркой", down: "недоступен", pending: "в очереди" };
+// Хэш onion-адреса — 56 знаков, в строке он вытесняет всё остальное, включая
+// путь, ради которого её и показывают. Сокращаем так же, как host у цели:
+// начало, многоточие, хвост (см. Target.label).
+const shortOnion = s => String(s ?? "").replace(
+  /([a-z2-7]{56})\.onion/gi, (_, h) => `${h.slice(0, 8)}…${h.slice(-8)}.onion`);
 
 function tape(history) {
   const slots = 60;
@@ -259,7 +269,8 @@ function card(t) {
   // Редирект зелёный, но куда он ведёт — сказать стоит: за ним капча, и
   // expect_text по такой цели уже не проверяется.
   const detail = !last ? ""
-    : last.error_slug === "redirect" ? `<div class="note">${esc(last.error)}</div>`
+    : last.error_slug === "redirect"
+      ? `<div class="redirect" title="${esc(last.error)}">${esc(shortOnion(last.error))}</div>`
     : status === "up" ? ""
     : status === "warn"
       ? `<div class="caveat">Сервис на связи · ${esc(last.error || "ответ не тот, которого ждали")}</div>`
