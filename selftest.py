@@ -34,12 +34,19 @@ async def http_backend(reader, writer):
         pass
     SEEN.append(head)
     parts = head.split(b" ")
-    body, extra = b"<html><title>hello onion</title></html>", b""
+    path = parts[1] if len(parts) > 1 else b"/"
+    body, extra, code = b"<html><title>hello onion</title></html>", b"", b"200 OK"
     # На /gz отвечаем сжатым телом: раз проверки просят gzip, как браузер,
     # они обязаны его разжимать — иначе expect_text перестанет находиться.
-    if len(parts) > 1 and parts[1] == b"/gz" and b"gzip" in head.lower():
+    if path == b"/gz" and b"gzip" in head.lower():
         body, extra = zlib.compress(body, wbits=31), b"Content-Encoding: gzip\r\n"
-    writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n%sConnection: close\r\n\r\n%s"
+    elif path == b"/captcha":
+        # Так встречает капча анти-DDoS. Путь с заглавными буквами не случаен:
+        # Location регистрозависим, и приводить его к нижнему регистру нельзя.
+        code, extra = b"302 Found", b"Location: /Check?id=A1b2\r\n"
+    elif path == b"/busy":
+        code = b"503 Service Unavailable"
+    writer.write(b"HTTP/1.1 " + code + b"\r\nContent-Length: %d\r\n%sConnection: close\r\n\r\n%s"
                  % (len(body), extra, body))
     try:
         await writer.drain()
@@ -176,6 +183,9 @@ async def main() -> int:
         {"name": "unreachable", "url": f"http://{FAIL}/", "timeout": 10},
         {"name": "tcp", "url": f"tcp://{GOOD}:1234", "mode": "tcp", "timeout": 10},
         {"name": "gzip", "url": f"http://{GOOD}/gz", "expect_text": "hello onion", "timeout": 10},
+        {"name": "captcha", "url": f"http://{GOOD}/captcha", "expect_text": "hello onion",
+         "timeout": 10},
+        {"name": "busy", "url": f"http://{GOOD}/busy", "timeout": 10},
     ]:
         store.add_target(ow.clean_target(spec, cfg))
 
@@ -187,8 +197,9 @@ async def main() -> int:
         await mon.run_check(t)
         await mon.run_check(t)
     for name, want in {"ok": True, "wrong-text": False, "wrong-status": False,
-                       "unreachable": False, "tcp": True, "gzip": True}.items():
-        check(f"{name} доступен", mon.last[name]["ok"], want)
+                       "unreachable": False, "tcp": True, "gzip": True,
+                       "captcha": False, "busy": False}.items():
+        check(f"{name}: ответ совпал с ожиданиями", mon.last[name]["ok"], want)
     check("причина сбоя разобрана", mon.last["unreachable"]["error_slug"], "descriptor_not_found")
 
     print("\n1a. Попытки, цепочки и заголовки")
@@ -211,14 +222,25 @@ async def main() -> int:
     check("наш служебный User-Agent наружу не уходит", "onionwatch/" in first, False)
 
     print("\n1б. Три состояния")
-    for name, want in {"ok": "up", "tcp": "up", "gzip": "up", "wrong-text": "warn",
-                       "wrong-status": "warn", "unreachable": "down"}.items():
+    for name, want in {"ok": "up", "tcp": "up", "gzip": "up", "captcha": "up",
+                       "wrong-text": "warn", "wrong-status": "warn", "busy": "warn",
+                       "unreachable": "down"}.items():
         check(f"{name}: состояние", mon.last[name]["state"], want)
     # Ответ не тем, чего ждали, — не падение: сервис на связи, и аптайм это видит.
     check("оговорка не роняет аптайм", store.summary("wrong-text", 3600)["uptime"], 100.0)
     check("оговорки посчитаны отдельно", store.summary("wrong-text", 3600)["warn"], 2)
     check("недоступность остаётся недоступностью",
           store.summary("unreachable", 3600)["uptime"], 0.0)
+
+    # Капча встречает редиректом — цель за ней доступна так же, как в браузере.
+    check("редирект разобран", mon.last["captcha"]["error_slug"], "redirect")
+    check("в подсказке видно, куда уводит", mon.last["captcha"]["error"],
+          "Редирект 302 на /Check?id=A1b2")
+    check("редирект не считается оговоркой", store.summary("captcha", 3600)["warn"], 0)
+    check("редирект не роняет аптайм", store.summary("captcha", 3600)["uptime"], 100.0)
+    check("под редиректом expect_text не проверяется", mon.last["captcha"]["phase"], "done")
+    # 503 — это «работает, но придерживает»: он должен остаться жёлтым.
+    check("503 остаётся оговоркой", mon.last["busy"]["error"], "HTTP 503, ожидался [200]")
 
     httpd = ow.ThreadingHTTPServer(("127.0.0.1", 0), ow.make_handler(mon))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -228,7 +250,7 @@ async def main() -> int:
     code, state = api("GET", "/api/state")
     check("/api/state отвечает", code, 200)
     check("сводка по состояниям",
-          (state["up"], state["warn"], state["down"], state["total"]), (3, 2, 1, 6))
+          (state["up"], state["warn"], state["down"], state["total"]), (4, 3, 1, 8))
     check("история пишется", len(state["targets"][0]["history"]), 2)
     check("страница дашборда отдаётся", api("GET", "/")[0], 200)
 
@@ -265,7 +287,7 @@ async def main() -> int:
     check("выключенная цель ушла из планировщика",
           (mon.sync_targets(), "новая-2" in mon.targets)[1], False)
     check("удаление цели", api("DELETE", f"/api/admin/targets/{tid}")[0], 200)
-    check("после удаления её нет", len(api("GET", "/api/admin/targets")[1]["targets"]), 6)
+    check("после удаления её нет", len(api("GET", "/api/admin/targets")[1]["targets"]), 8)
 
     print("\n6. Валидация адресов")
     for label, url in [("кириллица в адресе", "http://ВАШ-АДРЕС-1.onion/"),

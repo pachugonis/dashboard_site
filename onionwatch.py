@@ -76,6 +76,13 @@ RETRY_SLUGS = frozenset({
 # cookie: сервис жив, нас просто придержали. Стабильные 404 и 410 не повторяем.
 RETRY_STATUS = frozenset({403, 429, 500, 502, 503, 504})
 
+# Редиректы считаются нормальным ответом: именно так встречает капча, и цель за
+# ней доступна ровно так же, как при открытии в браузере. По редиректу мы не
+# идём — важно, что сервис на связи и отвечает осмысленно. 304 сюда не входит:
+# условных запросов мы не шлём, и «не изменилось» в ответ означает сломанный
+# сервер, а не переадресацию.
+REDIRECTS = frozenset({301, 302, 303, 307, 308})
+
 # Коды ответа SOCKS5: стандартные (RFC 1928) + расширения Tor (prop304).
 # Расширенные коды 0xF0–0xF7 Tor присылает, только если в torrc у SocksPort
 # выставлен флаг ExtendedErrors; иначе всё схлопывается в 0x01.
@@ -462,13 +469,18 @@ class Circuits:
         self._creds.pop(name, None)
 
 
-def _header(head: bytes, name: str) -> str:
-    """Значение заголовка из уже прочитанного блока, приведённое к нижнему регистру."""
+def _header(head: bytes, name: str, lower: bool = True) -> str:
+    """Значение заголовка из уже прочитанного блока.
+
+    По умолчанию приводит к нижнему регистру: так удобно сравнивать имена
+    кодировок. Для Location это недопустимо — путь в URL регистрозависим.
+    """
     want = name.encode().lower()
     for line in head.split(b"\r\n")[1:]:
         key, sep, value = line.partition(b":")
         if sep and key.strip().lower() == want:
-            return value.strip().decode("latin-1").lower()
+            got = value.strip().decode("latin-1")
+            return got.lower() if lower else got
     return ""
 
 
@@ -587,10 +599,21 @@ async def check_target(cfg: Config, t: Target, circuits: Circuits | None = None)
                     res["error_slug"] = "text_missing"
                     res["error"] = f"В ответе нет строки {t.expect_text!r}"
             if not ok and not res["error"]:
-                res["error_slug"] = "bad_status"
-                res["error"] = f"HTTP {res['status']}, ожидался {t.expect_status}"
+                if res["status"] in REDIRECTS:
+                    # Редирект — обычный ответ работающего сервиса: так отвечает
+                    # и капча анти-DDoS, и переехавшая страница. Мы по нему не
+                    # идём, но и недоступностью это не считаем, поэтому пишем,
+                    # куда зовут, а не «ожидался 200».
+                    where = _header(head, "Location", lower=False)
+                    res["error_slug"] = "redirect"
+                    res["error"] = (f"Редирект {res['status']} на {where}" if where
+                                    else f"Редирект {res['status']} без Location")
+                else:
+                    res["error_slug"] = "bad_status"
+                    res["error"] = f"HTTP {res['status']}, ожидался {t.expect_status}"
             res["ok"] = ok
-            res["phase"] = "done" if ok else res["phase"]
+            # Редирект — не фаза, на которой мы застряли: ответ прочитан целиком.
+            res["phase"] = "done" if ok or res["error_slug"] == "redirect" else res["phase"]
 
     except ProxyDown as e:
         res["error_slug"], res["error"] = "tor_down", str(e)
@@ -614,11 +637,16 @@ async def check_target(cfg: Config, t: Target, circuits: Circuits | None = None)
             except Exception:
                 pass
 
-    # Третье состояние. Если сервис ответил по HTTP — он на связи, каким бы код
-    # ни был: за onion-ресурсами обычно стоит анти-DDoS, и 403 с капчей значит
-    # «работает, но не пускает нас», а не «выключен». Красным остаётся только
-    # то, до чего мы не достучались: цепочка, таймаут до ответа, мёртвый tor.
-    res["state"] = "up" if res["ok"] else ("warn" if res["status"] is not None else "down")
+    # Состояние. Если сервис ответил по HTTP — он на связи, каким бы код ни был:
+    # за onion-ресурсами обычно стоит анти-DDoS, и 503 значит «работает, но
+    # придерживает нас», а не «выключен». Красным остаётся только то, до чего мы
+    # не достучались: цепочка, таймаут до ответа, мёртвый tor.
+    #
+    # Редирект — исключение, он идёт в зелёное наравне с совпавшим ответом:
+    # так отвечает капча, и цель за ней доступна ровно в том же смысле, в каком
+    # она открывается в браузере. Куда именно нас увели, видно в подсказке.
+    res["state"] = ("up" if res["ok"] or res["error_slug"] == "redirect"
+                    else "warn" if res["status"] is not None else "down")
     res["total_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     return res
 
