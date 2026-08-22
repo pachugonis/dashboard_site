@@ -4,7 +4,7 @@
 защиту маршрутов) и валидацию адресов. Сеть Tor и настоящие onion-сервисы
 не нужны.
 """
-import asyncio, base64, http.cookiejar, json, os, sqlite3, struct, sys, tempfile, threading, time
+import asyncio, base64, http.cookiejar, json, os, re, sqlite3, struct, sys, tempfile, threading, time
 import urllib.error, urllib.request, zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import onionwatch as ow
@@ -453,11 +453,19 @@ async def main() -> int:
          data_url(b'<svg viewBox="0 0 16 16"><circle r="8"/></svg>', "image/svg+xml")),
         ("оборванный SVG", data_url(make_svg()[:-6], "image/svg+xml")),
         ("слишком большая картинка",
-         data_url(b"\x89PNG\r\n\x1a\n" + b"\x00" * 1_100_000)),
+         data_url(b"\x89PNG\r\n\x1a\n" + b"\x00" * 5_300_000)),
     ]:
         code, resp = api("POST", "/api/admin/targets",
                          {"name": label, "url": f"http://{GOOD}/", "image": payload})
         check(label + " отклонена", code, 400)
+
+    # Предел — 5 МБ, и картинка на пару мегабайт обязана доезжать целиком:
+    # в base64 это уже больше прежнего предела тела запроса.
+    check("картинка на 2 МБ проходит",
+          api("PUT", f"/api/admin/targets/{img_id}",
+              {"name": "с-картинкой", "url": f"http://{GOOD}/",
+               "image": data_url(b"\x89PNG\r\n\x1a\n" + b"\x00" * 2_000_000)})[0], 200)
+    check("она же и отдаётся", len(api.raw(f"/api/targets/{img_id}/image")[2]), 2_000_008)
 
     check("удаление картинки",
           api("PUT", f"/api/admin/targets/{img_id}",
@@ -570,6 +578,23 @@ async def main() -> int:
     for page, text in pages.items():
         check(f"{page}: в меню есть ссылка на новости",
               'href="/news"' in text and "Новости" in text, True)
+
+    # Вкладки админки: цели и новости. Их переключение — целиком в браузере,
+    # серверу о них знать нечего, поэтому проверяем разметку.
+    check("в админке две вкладки",
+          [m for m in re.findall(r'data-tab="(\w+)"', admin_code)], ["targets", "news"])
+    for panel in ("tab-targets", "tab-news"):
+        check(f"вкладке {panel} есть что показывать", f'id="{panel}"' in admin_code, True)
+
+    # Предел картинки записан дважды: сервер режет байты, админка — длину
+    # data-URL. Разъехавшись, они дают «файл слишком тяжёлый» на том, что сервер
+    # бы принял, или наоборот — отказ уже после долгой загрузки.
+    ceiling = ow.MAX_IMAGE * 4 / 3
+    limit_chars = int(re.search(r"IMG_MAX_CHARS = (\d+)", admin_code).group(1))
+    check("предел админки совпадает с серверным",
+          0.99 * ceiling <= limit_chars <= ceiling, True)
+    check("тело запроса вмещает предельную картинку в base64",
+          ow.MAX_BODY > ceiling, True)
 
     print("\n10. Смена пароля и выход")
     check("смена с неверным текущим",

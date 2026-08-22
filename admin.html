@@ -42,6 +42,16 @@
   nav.nav a[aria-current="page"] { color: #fff; border-color: var(--circuit);
     background: linear-gradient(var(--panel-2), var(--panel)); }
 
+  /* Вкладки: цели и новости — две разные работы, и делать их на одной
+     простыне незачем. Первая панель вкладки сама отбивает её сверху. */
+  .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 20px; }
+  .tabs button { width: auto; font-size: 14px; padding: 9px 16px; color: var(--muted); }
+  .tabs button:hover { color: var(--text); border-color: #3a4270; }
+  .tabs button[aria-selected="true"] { color: #fff; font-weight: 600;
+    border-color: var(--circuit); background: linear-gradient(var(--panel-2), var(--panel)); }
+  .tabs .count { font-family: var(--mono); font-size: 11px; color: var(--dim);
+    margin-left: 8px; font-weight: 400; }
+
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
     padding: 20px; margin-top: 18px; }
   label { display: block; font-family: var(--mono); font-size: 10px; letter-spacing: .12em;
@@ -128,7 +138,7 @@
 
   <header class="top">
     <div>
-      <div class="eyebrow">Управление целями</div>
+      <div class="eyebrow">Цели и новости</div>
       <h1>onion<span>watch</span> — админка</h1>
     </div>
     <div class="top-right">
@@ -163,6 +173,17 @@
 
   <!-- Рабочая часть -->
   <section id="admin-view" class="hidden">
+
+    <div class="tabs" id="tabs" role="tablist" aria-label="Разделы админки">
+      <button role="tab" id="tab-btn-targets" data-tab="targets"
+              aria-controls="tab-targets" aria-selected="true">Цели<span
+              class="count" id="count-targets"></span></button>
+      <button role="tab" id="tab-btn-news" data-tab="news" tabindex="-1"
+              aria-controls="tab-news" aria-selected="false">Новости<span
+              class="count" id="count-news"></span></button>
+    </div>
+
+    <div id="tab-targets" role="tabpanel" aria-labelledby="tab-btn-targets">
 
     <div class="panel">
       <h2 id="form-title">Новая цель</h2>
@@ -226,7 +247,7 @@
                 <option value="crop">обрезать по центру</option>
               </select>
               <button type="button" id="f-img-clear" class="hidden">Убрать изображение</button>
-              <div class="hint">Годятся PNG, JPEG и SVG до 1 МБ. Квадрат
+              <div class="hint">Годятся PNG, JPEG и SVG до 5 МБ. Квадрат
                 собирается прямо в браузере: сторона до 256 пикселей, что мельче —
                 не растягиваем. «Вписать» сохраняет логотип целиком и нужен для
                 широких картинок; «обрезать» вырезает центр и подходит
@@ -249,9 +270,13 @@
     </div>
 
     <div class="panel">
-      <h2>Цели</h2>
+      <h2>Список целей</h2>
       <div id="targets"></div>
     </div>
+
+    </div><!-- /вкладка «Цели» -->
+
+    <div id="tab-news" role="tabpanel" aria-labelledby="tab-btn-news" class="hidden">
 
     <div class="panel">
       <h2 id="news-form-title">Новая новость</h2>
@@ -263,7 +288,7 @@
             <div class="img-ctl">
               <input type="file" id="n-file" accept="image/png,image/jpeg,image/svg+xml,.svg">
               <button type="button" id="n-img-clear" class="hidden">Убрать изображение</button>
-              <div class="hint">Годятся PNG, JPEG и SVG до 1 МБ. Картинку новости
+              <div class="hint">Годятся PNG, JPEG и SVG до 5 МБ. Картинку новости
                 не режут в квадрат — она уходит целиком, только уменьшается до
                 1024 пикселей по большей стороне. Необязательна: без неё новость
                 останется одним текстом.</div>
@@ -285,10 +310,13 @@
     </div>
 
     <div class="panel">
-      <h2>Новости</h2>
+      <h2>Опубликованные новости</h2>
       <div id="news"></div>
     </div>
 
+    </div><!-- /вкладка «Новости» -->
+
+    <!-- Пароль — не вкладка: он не про цели и не про новости. -->
     <div class="panel">
       <h2>Смена пароля</h2>
       <div class="fields">
@@ -329,7 +357,7 @@ function plural(n, one, few, many) {
 }
 
 const IMG_SIZE = 256;           // потолок стороны квадрата, который уходит на сервер
-const IMG_MAX_CHARS = 1390000;  // потолок сервера — 1 МБ, это он же в base64
+const IMG_MAX_CHARS = 6950000;  // потолок сервера — 5 МБ, это он же в base64
 
 // Файл читаем в data-URL, а не через URL.createObjectURL: CSP страницы
 // разрешает картинки только из 'self' и data:, и схему blob: браузер
@@ -362,7 +390,7 @@ async function passThroughSvg(file) {
   if (mark < 0) throw new Error("Файл не прочитался");
   const url = "data:image/svg+xml;base64," + read.slice(mark + "base64,".length);
   if (url.length > IMG_MAX_CHARS) {
-    throw new Error("SVG тяжелее 1 МБ — уменьшите файл заранее");
+    throw new Error("SVG тяжелее 5 МБ — уменьшите файл заранее");
   }
   await loadImage(url);   // не рисуется браузером — не поедет и на сервер
   return url;
@@ -410,7 +438,7 @@ async function passThroughRaster(file) {
   }
   if (url.length > IMG_MAX_CHARS) {
     throw new Error("Этот браузер запрещает читать canvas, поэтому уменьшить "
-                  + "картинку не выйдет — выберите файл до 1 МБ");
+                  + "картинку не выйдет — выберите файл до 5 МБ");
   }
   await loadImage(url);
   return url;
@@ -586,6 +614,43 @@ function show(authed) {
   el("admin-view").classList.toggle("hidden", !authed);
 }
 
+// -- вкладки ---------------------------------------------------------------
+
+// Открытая вкладка живёт в адресе: /admin#news открывает новости сразу,
+// а перезагрузка после сохранения оставляет там же, где были.
+const TABS = ["targets", "news"];
+
+function showTab(name) {
+  const tab = TABS.includes(name) ? name : TABS[0];
+  for (const id of TABS) {
+    el("tab-" + id).classList.toggle("hidden", id !== tab);
+    const btn = el("tab-btn-" + id);
+    btn.setAttribute("aria-selected", String(id === tab));
+    // Табом ходят между вкладками и содержимым, между самими вкладками —
+    // стрелками: так этого ждёт скринридер.
+    btn.tabIndex = id === tab ? 0 : -1;
+  }
+  if (location.hash.slice(1) !== tab) history.replaceState(null, "", "#" + tab);
+}
+
+el("tabs").addEventListener("click", ev => {
+  const btn = ev.target.closest("[data-tab]");
+  if (btn) showTab(btn.dataset.tab);
+});
+
+el("tabs").addEventListener("keydown", ev => {
+  const step = ev.key === "ArrowRight" ? 1 : ev.key === "ArrowLeft" ? -1 : 0;
+  if (!step) return;
+  ev.preventDefault();
+  const now = TABS.findIndex(
+    id => el("tab-btn-" + id).getAttribute("aria-selected") === "true");
+  const next = TABS[(now + step + TABS.length) % TABS.length];
+  showTab(next);
+  el("tab-btn-" + next).focus();
+});
+
+window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
+
 async function boot() {
   const s = await (await fetch("/api/session", { cache: "no-store" })).json();
   el("meta").innerHTML = s.authed
@@ -600,6 +665,7 @@ async function boot() {
       + "python3 onionwatch.py --config <конфиг> --set-admin admin";
   show(s.authed);
   if (s.authed) {
+    showTab(location.hash.slice(1));
     showThumb(null);
     setOnions([]);
     loadTargets();
@@ -666,6 +732,7 @@ async function loadTargets() {
     el("f-interval").placeholder = `по умолчанию ${defaults.interval}`;
     el("f-timeout").placeholder = `по умолчанию ${Math.round(defaults.timeout)}`;
     window.__targets = data.targets;
+    el("count-targets").textContent = data.targets.length;
     el("targets").innerHTML = data.targets.length
       ? `<table><thead><tr><th>Цель</th><th>Статус</th><th>Проверка</th><th></th></tr></thead>
          <tbody>${data.targets.map(targetRow).join("")}</tbody></table>`
@@ -882,6 +949,7 @@ async function loadNews() {
     // админского списка нет, показывать в нём было бы нечего сверх этого.
     const data = await api("GET", "/api/news");
     window.__news = data.news;
+    el("count-news").textContent = data.news.length;
     el("news").innerHTML = data.news.length
       ? `<table><thead><tr><th>Новость</th><th></th></tr></thead>
          <tbody>${data.news.map(newsRow).join("")}</tbody></table>`
