@@ -112,16 +112,10 @@ def make_png(side: int = 2) -> bytes:
             + chunk(b"IEND", b""))
 
 
-def make_gif() -> bytes:
-    """Минимальный, но настоящий GIF 1x1: заголовок, палитра, кадр, терминатор."""
-    return (b"GIF89a"
-            + b"\x01\x00\x01\x00"                  # ширина и высота
-            + b"\x80\x00\x00"                      # глобальная палитра из двух цветов
-            + b"\xff\xff\xff\x00\x00\x00"          # белый и чёрный
-            + b"\x21\xf9\x04\x01\x00\x00\x00\x00"  # управление графикой
-            + b"\x2c\x00\x00\x00\x00\x01\x00\x01\x00\x00"  # дескриптор кадра
-            + b"\x02\x02\x44\x01\x00"              # данные LZW
-            + b"\x3b")                             # трейлер
+def make_svg(inner: str = '<circle cx="8" cy="8" r="8" fill="#f00"/>') -> bytes:
+    """SVG с пространством имён — без него браузер покажет пустоту, и сервер это знает."""
+    return ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+            f'{inner}</svg>').encode()
 
 
 def data_url(blob: bytes, ctype: str = "image/png") -> str:
@@ -406,26 +400,58 @@ async def main() -> int:
     check("отдаётся уже новая картинка",
           api.raw(f"/api/targets/{img_id}/image")[2] == make_png(3), True)
 
-    gif = make_gif()
-    code, gif_made = api("POST", "/api/admin/targets",
-                         {"name": "с-гифкой", "url": f"http://{GOOD}/anim",
-                          "image": data_url(gif, "image/gif")})
-    check("цель с GIF создана", code, 201)
-    gif_id = gif_made.get("id")
-    status, headers, body = api.raw(f"/api/targets/{gif_id}/image")
-    check("GIF отдаётся как GIF", headers.get("Content-Type"), "image/gif")
-    check("GIF не перекодирован — байты те же", body == gif, True)
-    api("DELETE", f"/api/admin/targets/{gif_id}")
+    svg = make_svg()
+    code, svg_made = api("POST", "/api/admin/targets",
+                         {"name": "с-вектором", "url": f"http://{GOOD}/logo.svg",
+                          "image": data_url(svg, "image/svg+xml")})
+    check("цель с SVG создана", code, 201)
+    svg_id = svg_made.get("id")
+    status, headers, body = api.raw(f"/api/targets/{svg_id}/image")
+    check("SVG отдаётся как SVG", headers.get("Content-Type"), "image/svg+xml")
+    check("SVG не перекодирован — байты те же", body == svg, True)
+    # SVG исполняется браузером, а этот адрес открывается прямой ссылкой без
+    # пароля: скрипты должна запрещать политика самого ответа.
+    csp = headers.get("Content-Security-Policy") or ""
+    check("у картинки своя глухая CSP", "default-src 'none'" in csp and "sandbox" in csp, True)
+    check("общая политика страниц на картинку не распространяется",
+          "script-src" in csp, False)
+    api("DELETE", f"/api/admin/targets/{svg_id}")
+
+    # Ссылка на кусок того же файла и вшитый растр — это рисование, а не выход
+    # наружу: проверка форматов не должна отвергать нормальные логотипы.
+    inner = ('<defs><linearGradient id="g"/></defs>'
+             '<rect width="16" height="16" fill="url(#g)"/>'
+             f'<image href="{data_url(png)}" width="8" height="8"/>')
+    code, tame = api("POST", "/api/admin/targets",
+                     {"name": "вектор-с-растром", "url": f"http://{GOOD}/mix.svg",
+                      "image": data_url(make_svg(inner), "image/svg+xml")})
+    check("SVG со ссылками внутрь себя принят", code, 201)
+    api("DELETE", f"/api/admin/targets/{tame.get('id')}")
 
     for label, payload in [
         ("мусор вместо data-URL", "просто строка"),
-        ("GIF без трейлера", data_url(gif[:-1], "image/gif")),
-        ("PNG под видом GIF", data_url(png, "image/gif")),
+        ("GIF больше не принимается", data_url(b"GIF89a\x01\x00", "image/gif")),
+        ("WebP больше не принимается", data_url(b"RIFF\x00\x00\x00\x00WEBP", "image/webp")),
         ("чужая схема данных", "data:text/html;base64,PGh0bWw+"),
         ("тип не совпадает с содержимым", data_url(png, "image/jpeg")),
+        ("PNG под видом SVG", data_url(png, "image/svg+xml")),
         ("пустое содержимое", "data:image/png;base64,"),
+        ("SVG со скриптом",
+         data_url(make_svg("<script>alert(1)</script>"), "image/svg+xml")),
+        ("SVG с обработчиком события",
+         data_url(make_svg('<circle r="8" onload="alert(1)"/>'), "image/svg+xml")),
+        ("SVG со ссылкой наружу",
+         data_url(make_svg('<image href="http://evil.onion/p.png"/>'), "image/svg+xml")),
+        ("SVG с javascript-ссылкой",
+         data_url(make_svg('<a href="javascript:alert(1)"><circle r="8"/></a>'),
+                  "image/svg+xml")),
+        ("SVG с DTD",
+         data_url(b'<!DOCTYPE svg [<!ENTITY a "b">]>' + make_svg(), "image/svg+xml")),
+        ("SVG без пространства имён",
+         data_url(b'<svg viewBox="0 0 16 16"><circle r="8"/></svg>', "image/svg+xml")),
+        ("оборванный SVG", data_url(make_svg()[:-6], "image/svg+xml")),
         ("слишком большая картинка",
-         data_url(b"\x89PNG\r\n\x1a\n" + b"\x00" * 600_000)),
+         data_url(b"\x89PNG\r\n\x1a\n" + b"\x00" * 1_100_000)),
     ]:
         code, resp = api("POST", "/api/admin/targets",
                          {"name": label, "url": f"http://{GOOD}/", "image": payload})

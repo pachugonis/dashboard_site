@@ -36,6 +36,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 import zlib
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -102,20 +103,37 @@ SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32, "maxmem": 64 * 1024 * 1024}
 ONION_V3 = re.compile(r"^[a-z2-7]{56}\.onion$")
 NAME_RE = re.compile(r"^[^/\\\x00-\x1f]{1,64}$")
 MAX_ONIONS = 10               # сколько onion-зеркал можно завести одной цели
-MAX_BODY = 1024 * 1024        # в теле может приехать картинка в base64
-MAX_IMAGE = 512 * 1024
+MAX_BODY = 2 * 1024 * 1024    # в теле может приехать картинка в base64, а он на треть длиннее
+MAX_IMAGE = 1024 * 1024
 
-# Картинку обрезает и уменьшает браузер, сюда приходит готовый квадрат.
+# Растр обрезает и уменьшает браузер, сюда приходит готовый квадрат.
 # Сервер обязан перепроверить формат: доверять Content-Type от клиента нельзя.
-# GIF — исключение: он приходит как есть, без перекодирования, иначе от
-# анимации остался бы первый кадр. В квадрат его обрезает уже вёрстка.
+# SVG — исключение: он вектор, обрезать в нём по пикселям нечего, и приходит он
+# как есть. Зато это XML, который браузер исполняет, — его проверяет check_svg.
 IMAGE_MAGIC = {
     "image/png": (b"\x89PNG\r\n\x1a\n",),
     "image/jpeg": (b"\xff\xd8\xff",),
-    "image/webp": (b"RIFF",),
-    "image/gif": (b"GIF87a", b"GIF89a"),
 }
-DATA_URL = re.compile(r"data:(image/(?:png|jpeg|webp|gif));base64,([A-Za-z0-9+/=\s]+)")
+SVG_TYPE = "image/svg+xml"
+DATA_URL = re.compile(r"data:(image/(?:png|jpeg|svg\+xml));base64,([A-Za-z0-9+/=\s]+)")
+
+# Внутрь SVG пускаем только то, что рисует. Всё, что умеет исполняться или
+# ходить наружу, — отказ целиком: вычистить такой файл надёжно всё равно не
+# выйдет, а лежит он в нашем же источнике и открывается прямой ссылкой.
+SVG_BANNED = (
+    (re.compile(r"<\s*(?:script|foreignObject|iframe|embed|object|handler)\b", re.I),
+     "В SVG есть исполняемые элементы"),
+    (re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.I),
+     "В SVG есть DTD — так собирают XXE и «миллиард смешков»"),
+    (re.compile(r"<\?xml-stylesheet\b", re.I), "В SVG есть внешняя таблица стилей"),
+    (re.compile(r"\son[a-z]+\s*=", re.I), "В SVG есть обработчики событий"),
+    (re.compile(r"javascript\s*:", re.I), "В SVG есть javascript-ссылка"),
+    (re.compile(r"url\(\s*['\"]?\s*(?:[a-z][a-z0-9+.-]*:|//)", re.I),
+     "В SVG есть ссылка наружу в стилях"),
+)
+# Ссылаться можно на кусок этого же файла или на вшитый в него растр.
+SVG_REF = re.compile(r"""(?:xlink:)?(?:href|src)\s*=\s*(["'])(.*?)\1""", re.I | re.S)
+SVG_SAFE_REF = re.compile(r"(?:#|data:image/(?:png|jpeg);base64,)", re.I)
 
 
 class ProxyDown(Exception):
@@ -384,11 +402,33 @@ def clean_target(data: dict[str, Any], cfg: Config) -> tuple[dict[str, Any], lis
     return row, urls
 
 
+def check_svg(blob: bytes) -> None:
+    """Пускает дальше только рисующее подмножество SVG. Бросает Invalid с текстом для UI."""
+    try:
+        text = blob.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise Invalid("SVG не читается как текст в UTF-8") from e
+    for pattern, message in SVG_BANNED:
+        if pattern.search(text):
+            raise Invalid(message)
+    for _, ref in SVG_REF.findall(text):
+        if not SVG_SAFE_REF.match(ref.strip()):
+            raise Invalid(f"В SVG есть ссылка наружу: {ref.strip()[:40]}")
+    # Разбираем как XML: браузер сделает то же самое и покажет пустоту, если
+    # файл битый или без пространства имён SVG.
+    try:
+        root = ET.fromstring(blob)
+    except ET.ParseError as e:
+        raise Invalid("SVG не разбирается как XML — файл повреждён") from e
+    if root.tag != "{http://www.w3.org/2000/svg}svg":
+        raise Invalid("Корень файла — не <svg> из пространства имён SVG")
+
+
 def parse_image(data_url: str) -> tuple[bytes, str]:
     """Разбирает data-URL от админки в (байты, тип). Бросает Invalid с текстом для UI."""
     m = DATA_URL.fullmatch(str(data_url).strip())
     if not m:
-        raise Invalid("Изображение должно быть data-URL в формате PNG, JPEG или WebP")
+        raise Invalid("Изображение должно быть data-URL в формате PNG, JPEG или SVG")
     ctype = m.group(1)
     try:
         blob = base64.b64decode(m.group(2), validate=False)
@@ -397,14 +437,12 @@ def parse_image(data_url: str) -> tuple[bytes, str]:
     if not blob:
         raise Invalid("Изображение пустое")
     if len(blob) > MAX_IMAGE:
-        raise Invalid(f"Изображение больше {MAX_IMAGE // 1024} КБ — уменьшите его")
+        raise Invalid(f"Изображение больше {MAX_IMAGE / (1024 * 1024):g} МБ — уменьшите его")
+    if ctype == SVG_TYPE:
+        check_svg(blob)
     # Проверяем сигнатуру: заявленный тип должен совпадать с содержимым.
-    if not blob.startswith(IMAGE_MAGIC[ctype]):
+    elif not blob.startswith(IMAGE_MAGIC[ctype]):
         raise Invalid("Содержимое файла не похоже на заявленный формат")
-    if ctype == "image/gif" and not blob.rstrip(b"\x00").endswith(b";"):
-        raise Invalid("GIF обрывается — файл повреждён или загрузился не целиком")
-    if ctype == "image/webp" and blob[8:12] != b"WEBP":
-        raise Invalid("Файл начинается как RIFF, но это не WebP")
     return blob, ctype
 
 
@@ -1406,10 +1444,11 @@ def make_handler(monitor: Monitor):
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Content-Security-Policy",
-                             "default-src 'none'; img-src 'self' data:; "
-                             "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
-                             "connect-src 'self'; form-action 'none'; frame-ancestors 'none'")
+            if not (extra or {}).get("Content-Security-Policy"):
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'none'; img-src 'self' data:; "
+                                 "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+                                 "connect-src 'self'; form-action 'none'; frame-ancestors 'none'")
             if cookie:
                 self.send_header("Set-Cookie", cookie)
             self.end_headers()
@@ -1640,9 +1679,16 @@ def make_handler(monitor: Monitor):
                 self.end_headers()
                 return
             # Дашборд перерисовывается каждые 15 секунд — картинку он должен
-            # брать из кэша, а не тащить заново.
-            self._send(200, blob, ctype,
-                       extra={"ETag": etag, "Cache-Control": "private, max-age=300"})
+            # брать из кэша, а не тащить заново. Политика здесь своя и глухая:
+            # SVG браузер исполняет, а этот адрес открывается прямой ссылкой без
+            # пароля — общая политика страниц разрешает скрипты, эта не разрешает
+            # ничего. Инлайновые стили оставлены: без них SVG теряет вид.
+            self._send(200, blob, ctype, extra={
+                "ETag": etag,
+                "Cache-Control": "private, max-age=300",
+                "Content-Security-Policy":
+                    "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+            })
 
         def _apply_image(self, tid: int, data: dict[str, Any]) -> None:
             raw = data.get("image")

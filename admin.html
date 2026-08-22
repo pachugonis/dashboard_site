@@ -196,16 +196,18 @@
           <div class="img-row">
             <div class="thumb" id="f-thumb" aria-hidden="true"></div>
             <div class="img-ctl">
-              <input type="file" id="f-file" accept="image/png,image/jpeg,image/webp,image/gif">
+              <input type="file" id="f-file" accept="image/png,image/jpeg,image/svg+xml,.svg">
               <select id="f-fit">
                 <option value="fit">вписать целиком, поля прозрачные</option>
                 <option value="crop">обрезать по центру</option>
               </select>
               <button type="button" id="f-img-clear" class="hidden">Убрать изображение</button>
-              <div class="hint">Квадрат 256×256 собирается прямо в браузере.
-                «Вписать» сохраняет логотип целиком и нужен для широких картинок;
-                «обрезать» вырезает центр и подходит фотографиям. GIF уходит как
-                есть, чтобы сохранить анимацию, — до 512 КБ.</div>
+              <div class="hint">Годятся PNG, JPEG и SVG до 1 МБ. Квадрат
+                собирается прямо в браузере: сторона до 256 пикселей, что мельче —
+                не растягиваем. «Вписать» сохраняет логотип целиком и нужен для
+                широких картинок; «обрезать» вырезает центр и подходит
+                фотографиям. SVG уходит как есть — вектор режут не пиксели,
+                а вёрстка.</div>
             </div>
           </div>
         </div>
@@ -263,8 +265,8 @@ function plural(n, one, few, many) {
   return `${n} ${word}`;
 }
 
-const IMG_SIZE = 256;          // сторона квадрата, который уходит на сервер
-const IMG_MAX_CHARS = 690000;  // потолок сервера — 512 КБ, это они же в base64
+const IMG_SIZE = 256;           // потолок стороны квадрата, который уходит на сервер
+const IMG_MAX_CHARS = 1390000;  // потолок сервера — 1 МБ, это он же в base64
 
 // Файл читаем в data-URL, а не через URL.createObjectURL: CSP страницы
 // разрешает картинки только из 'self' и data:, и схему blob: браузер
@@ -287,23 +289,32 @@ function loadImage(src) {
   });
 }
 
-// GIF отправляем как есть. Перерисовка через canvas оставила бы от анимации
-// один кадр, а собрать GIF обратно браузер не умеет — в квадрат его обрезает
-// вёрстка (квадратный бокс плюс object-fit/background-size: cover).
-async function passThroughGif(file) {
-  const url = await readDataUrl(file);
-  if (!/^data:image\/gif;base64,/.test(url)) {
-    throw new Error("Файл не читается как GIF");
-  }
+// SVG отправляем как есть: это вектор, обрезать в нём по пикселям нечего, а
+// перерисовка через canvas превратила бы его в тот самый растр, вместо которого
+// его и берут. В квадрат его вписывает вёрстка. Тип из FileReader переписываем:
+// у файла, выбранного в системе без записи о .svg, он приезжает пустым.
+async function passThroughSvg(file) {
+  const read = await readDataUrl(file);
+  const mark = read.indexOf("base64,");
+  if (mark < 0) throw new Error("Файл не прочитался");
+  const url = "data:image/svg+xml;base64," + read.slice(mark + "base64,".length);
   if (url.length > IMG_MAX_CHARS) {
-    throw new Error("GIF тяжелее 512 КБ — анимацию нельзя ужать "
-                  + "в браузере, уменьшите файл заранее");
+    throw new Error("SVG тяжелее 1 МБ — уменьшите файл заранее");
   }
+  await loadImage(url);   // не рисуется браузером — не поедет и на сервер
   return url;
 }
 
-function prepareImage(file, mode) {
-  return file.type === "image/gif" ? passThroughGif(file) : squareCrop(file, mode);
+function isSvg(file) {
+  return file.type === "image/svg+xml" || /\.svg$/i.test(file.name || "");
+}
+
+async function prepareImage(file, mode) {
+  if (isSvg(file)) return passThroughSvg(file);
+  if (file.type !== "image/png" && file.type !== "image/jpeg") {
+    throw new Error("Годятся только PNG, JPEG и SVG");
+  }
+  return squareCrop(file, mode);
 }
 
 // Обрезка в квадрат по центру и уменьшение делаются здесь: у демона нет
@@ -329,6 +340,14 @@ function toSquare(img, size, mode) {
   return canvas;
 }
 
+// Сторона итогового квадрата: 256 — это потолок, а не цель. Картинку мельче
+// растягивать нечем, от увеличения она только размылится и потяжелеет, так что
+// маленькая уходит в своём размере, а режется только та, что крупнее нужного.
+function squareSide(img, mode) {
+  const w = img.naturalWidth, h = img.naturalHeight;
+  return Math.min(IMG_SIZE, mode === "crop" ? Math.min(w, h) : Math.max(w, h));
+}
+
 function hasAlpha(canvas) {
   const data = canvas.getContext("2d")
     .getImageData(0, 0, canvas.width, canvas.height).data;
@@ -343,15 +362,16 @@ async function squareCrop(file, mode) {
   if (!Math.min(img.naturalWidth, img.naturalHeight)) {
     throw new Error("Не удалось определить размер изображения");
   }
-  const canvas = toSquare(img, IMG_SIZE, mode);
+  const side = squareSide(img, mode);
+  const canvas = toSquare(img, side, mode);
 
   // Картинку с прозрачностью в JPEG переводить нельзя: он прозрачность не
   // умеет, под неё пришлось бы подложить фон — и светлый логотип, нарисованный
   // по прозрачному, слился бы с ним начисто. Такие остаются PNG, а если не
   // влезают в лимит, уменьшаем сторону, но формат не меняем.
   if (hasAlpha(canvas)) {
-    for (const size of [IMG_SIZE, 192, 160, 128]) {
-      const out = (size === IMG_SIZE ? canvas : toSquare(img, size, mode))
+    for (const size of [side, 192, 160, 128].filter(v => v <= side)) {
+      const out = (size === side ? canvas : toSquare(img, size, mode))
         .toDataURL("image/png");
       if (out.length <= IMG_MAX_CHARS) return out;
     }
