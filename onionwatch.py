@@ -111,7 +111,8 @@ MAX_IMAGE = 5 * 1024 * 1024
 MAX_BODY = 8 * 1024 * 1024
 MAX_NEWS_TEXT = 4000          # новость — заметка под картинкой, а не статья
 MAX_SOURCE_URL = 500          # ссылка на первоисточник новости
-NEWS_LIMIT = 100              # сколько новостей отдаётся на страницу
+NEWS_PER_PAGE = 10            # сколько новостей на одной странице ленты
+NEWS_ADMIN_LIMIT = 500        # сколько новостей видит админка — там они правятся списком
 
 # Растр обрезает и уменьшает браузер, сюда приходит готовый квадрат.
 # Сервер обязан перепроверить формат: доверять Content-Type от клиента нельзя.
@@ -1210,13 +1211,18 @@ class Store:
 
     # -- новости -----------------------------------------------------------
 
-    def list_news(self, limit: int = NEWS_LIMIT) -> list[dict[str, Any]]:
+    def count_news(self) -> int:
+        with self.lock:
+            return int(self.db.execute("SELECT COUNT(*) c FROM news").fetchone()["c"])
+
+    def list_news(self, limit: int = NEWS_PER_PAGE, offset: int = 0) -> list[dict[str, Any]]:
         """Лента для страницы новостей: свежие сверху, без самих блобов."""
         with self.lock:
             rows = self.db.execute(
                 "SELECT id, text, source, created_at, updated_at,"
                 " image IS NOT NULL AS has_image FROM news"
-                " ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
+                " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                (limit, offset)).fetchall()
         return [{"id": int(r["id"]), "text": r["text"], "source": r["source"],
                  "created_at": r["created_at"], "updated_at": r["updated_at"],
                  "has_image": bool(r["has_image"]),
@@ -1696,7 +1702,7 @@ def make_handler(monitor: Monitor):
                 if path == "/api/news":
                     if not self._public_ok():
                         return self._json(401, {"error": "Нужен вход"})
-                    return self._json(200, {"news": store.list_news()})
+                    return self._json(200, self._news_page())
 
                 if path.startswith("/api/news/") and path.endswith("/image"):
                     if not self._public_ok():
@@ -1710,6 +1716,14 @@ def make_handler(monitor: Monitor):
                     name = urllib.parse.unquote(path.split("/")[3])
                     return self._json(200, {"target": name,
                                             "history": store.history(name, 500)})
+
+                if path == "/api/admin/news":
+                    if not self._require_admin():
+                        return None
+                    # Админке лента отдаётся целиком: править можно любую
+                    # новость, а не только ту, что попала на первую страницу.
+                    return self._json(200, {"news": store.list_news(NEWS_ADMIN_LIMIT),
+                                            "total": store.count_news()})
 
                 if path == "/api/admin/targets":
                     if not self._require_admin():
@@ -1865,6 +1879,26 @@ def make_handler(monitor: Monitor):
                 "Content-Security-Policy":
                     "default-src 'none'; style-src 'unsafe-inline'; sandbox",
             })
+
+        def _news_page(self) -> dict[str, Any]:
+            """Одна страница ленты: свежие сверху, NEWS_PER_PAGE штук за раз."""
+            total = store.count_news()
+            pages = max(1, -(-total // NEWS_PER_PAGE))
+            raw = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(self.path).query).get("page", ["1"])[0]
+            try:
+                page = int(raw)
+            except ValueError as e:
+                raise Invalid("Номер страницы должен быть числом") from e
+            # Ссылку из закладок, оставшуюся за краем ленты, показываем как
+            # последнюю страницу, а не как пустоту: новости сдвигаются вниз
+            # по мере появления новых, и такая ссылка стареет сама собой.
+            page = min(max(page, 1), pages)
+            return {
+                "news": store.list_news(NEWS_PER_PAGE, (page - 1) * NEWS_PER_PAGE),
+                "page": page, "pages": pages, "total": total,
+                "per_page": NEWS_PER_PAGE,
+            }
 
         def _image_of(self, data: dict[str, Any]) -> tuple[bytes, str] | None:
             """Картинка из тела запроса, если её прислали."""

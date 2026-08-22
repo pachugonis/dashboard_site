@@ -293,6 +293,7 @@ async def main() -> int:
     check("создание цели без сессии", api("POST", "/api/admin/targets", {"url": "x"})[0], 401)
     check("публикация новости без сессии",
           api("POST", "/api/admin/news", {"text": "тайком"})[0], 401)
+    check("админский список новостей без сессии", api("GET", "/api/admin/news")[0], 401)
     check("админа ещё нет", api("GET", "/api/session")[1]["has_admin"], False)
 
     print("\n4. Вход по логину и паролю")
@@ -586,6 +587,39 @@ async def main() -> int:
     check("в ленте осталась одна", len(api("GET", "/api/news")[1]["news"]), 1)
     check("страница новостей отдаётся", api("GET", "/news")[0], 200)
 
+    print("\n8б. Страницы ленты")
+    check("одной новости хватает одной страницы",
+          api("GET", "/api/news")[1]["pages"], 1)
+    batch = [api("POST", "/api/admin/news", {"text": f"Новость {i:02d}"})[1].get("id")
+             for i in range(1, 13)]
+    first = api("GET", "/api/news")[1]
+    second = api("GET", "/api/news?page=2")[1]
+    check("всего новостей", first["total"], 13)
+    check("на странице десять", len(first["news"]), 10)
+    check("страниц две", (first["page"], first["pages"], first["per_page"]), (1, 2, 10))
+    check("на второй — остаток", len(second["news"]), 3)
+    check("страницы не пересекаются",
+          {n["id"] for n in first["news"]} & {n["id"] for n in second["news"]}, set())
+    check("свежая новость — на первой", first["news"][0]["text"], "Новость 12")
+    check("самая старая — в конце последней",
+          second["news"][-1]["text"], "Новость без картинки")
+
+    # Ссылка из закладок стареет сама собой: новости сдвигаются вниз, и номер
+    # за краем ленты должен приводить к последней странице, а не к пустоте.
+    check("страница за краем — последняя", api("GET", "/api/news?page=99")[1]["page"], 2)
+    check("нулевая страница — первая", api("GET", "/api/news?page=0")[1]["page"], 1)
+    check("отрицательная — первая", api("GET", "/api/news?page=-3")[1]["page"], 1)
+    check("нечисловая страница отклонена", api("GET", "/api/news?page=abc")[0], 400)
+
+    # Админке лента нужна целиком: править можно любую новость, а не только
+    # ту, что попала на первую страницу.
+    check("админке лента отдаётся целиком",
+          len(api("GET", "/api/admin/news")[1]["news"]), 13)
+    for nid in batch:
+        api("DELETE", f"/api/admin/news/{nid}")
+    check("после уборки снова одна страница",
+          (api("GET", "/api/news")[1]["pages"], api("GET", "/api/news")[1]["total"]), (1, 1))
+
     print("\n9. Страницы и заголовок CSP")
     # Страницы и CSP правятся порознь, и рассогласование не видно ни в одном
     # серверном тесте: браузер просто молча не загружает ресурс. Схема blob:
@@ -622,6 +656,10 @@ async def main() -> int:
     check("лента новостей шириной с дашборд",
           width("news.html"), width("dashboard.html"))
     check("в ленте есть ссылка «Источник»", ">Источник" in news_code, True)
+    # Номер страницы ленты обязан быть в адресе: ссылку на вторую страницу
+    # должно быть можно дать, а «назад» — вернуть на предыдущую.
+    check("страница ленты берётся из адреса",
+          "?page=" in news_code and "popstate" in news_code, True)
     check("источник открывается в новом окне и без opener",
           'target="_blank"' in news_code and "noopener" in news_code, True)
 

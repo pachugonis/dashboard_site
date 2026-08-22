@@ -83,6 +83,21 @@
     display: inline-block; }
   .source a:hover { color: var(--text); border-color: #3a4270; }
 
+  /* Пейджер: стрелки по краям, номера между ними. Выглядит как верхнее меню —
+     это те же ссылки, только внутри ленты. */
+  .pager { display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+    justify-content: center; margin-top: 22px; }
+  .pager a, .pager span { font-family: var(--mono); font-size: 12px;
+    letter-spacing: .04em; text-decoration: none; color: var(--muted);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px;
+    background: var(--panel); }
+  .pager a:hover { background: var(--panel-2); border-color: #3a4270; color: var(--text); }
+  .pager .here { color: #fff; border-color: var(--circuit);
+    background: linear-gradient(var(--panel-2), var(--panel)); }
+  /* Недоступная стрелка и многоточие — не кнопки: ни рамки, ни фона. */
+  .pager .off { color: var(--dim); border-color: transparent; background: none; }
+  .pager .gap { border-color: transparent; background: none; padding: 7px 2px; }
+
   .empty-state { border: 1px dashed var(--line); border-radius: 12px; padding: 44px 24px;
     text-align: center; color: var(--muted); }
   .empty-state a { color: var(--circuit); }
@@ -109,6 +124,7 @@
 
   <div id="banner"></div>
   <div class="feed" id="feed"></div>
+  <div id="pager"></div>
 </div>
 
 <script>
@@ -150,15 +166,67 @@ function post(n) {
   </article>`;
 }
 
-async function load() {
+// -- страницы --------------------------------------------------------------
+
+// Номер страницы живёт в адресе: ссылку на вторую можно дать кому угодно,
+// а «назад» в браузере возвращает туда, где были.
+const pageFromUrl = () => {
+  const n = Number(new URLSearchParams(location.search).get("page"));
+  return Number.isInteger(n) && n > 0 ? n : 1;
+};
+
+// Номера вокруг текущей страницы: первая, последняя и соседи, между ними —
+// многоточие. Иначе на двадцатой странице пейджер занял бы больше места,
+// чем сама новость.
+function pageNumbers(page, pages) {
+  const near = [1, pages, page, page - 1, page + 1]
+    .filter(n => n >= 1 && n <= pages)
+    .sort((a, b) => a - b);
+  const out = [];
+  for (const n of near) {
+    const last = out[out.length - 1];
+    if (last === n) continue;
+    if (out.length && n - last > 1) out.push(null);   // разрыв в нумерации
+    out.push(n);
+  }
+  return out;
+}
+
+// Первая страница живёт по чистому адресу: ?page=1 — тот же /news.
+const pageHref = n => n > 1 ? `?page=${n}` : location.pathname;
+
+function pager(page, pages) {
+  if (pages < 2) return "";
+  const link = (n, text, extra = "") =>
+    `<a href="${pageHref(n)}" data-page="${n}" ${extra}>${esc(String(text))}</a>`;
+  const arrow = (n, text, ok) => ok ? link(n, text)
+    : `<span class="off" aria-hidden="true">${esc(text)}</span>`;
+  const numbers = pageNumbers(page, pages).map(n =>
+    n === null ? `<span class="gap" aria-hidden="true">…</span>`
+    : n === page ? `<span class="here" aria-current="page"
+                      aria-label="Страница ${n} из ${pages}">${n}</span>`
+    : link(n, n, `aria-label="Страница ${n}"`));
+  return `<nav class="pager" aria-label="Страницы новостей">
+    ${arrow(page - 1, "← Новее", page > 1)}
+    ${numbers.join("")}
+    ${arrow(page + 1, "Старее →", page < pages)}
+  </nav>`;
+}
+
+async function load(page) {
   try {
-    const r = await fetch("/api/news", { cache: "no-store" });
+    const r = await fetch(`/api/news?page=${page}`, { cache: "no-store" });
     if (r.status === 401) { location.href = "/admin"; return; }
     if (!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
+    el("banner").innerHTML = "";
     el("feed").innerHTML = data.news.length ? data.news.map(post).join("")
       : `<div class="empty-state">Новостей пока нет.<br>
          Первую можно опубликовать в <a href="/admin">админке</a>.</div>`;
+    el("pager").innerHTML = pager(data.page, data.pages);
+    // Сервер мог поправить номер: страницы за краем ленты он сводит
+    // к последней. Адрес приводим к тому, что получили на самом деле.
+    if (data.page !== page) history.replaceState(null, "", pageHref(data.page));
   } catch (e) {
     el("banner").innerHTML =
       `<div class="banner">Новости не загрузились: ${esc(e.message)}.
@@ -166,7 +234,20 @@ async function load() {
   }
 }
 
-load();
+el("pager").addEventListener("click", ev => {
+  const link = ev.target.closest("a[data-page]");
+  // Ctrl, Shift и средняя кнопка открывают ссылку по-своему — не мешаем.
+  if (!link || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+  ev.preventDefault();
+  const page = Number(link.dataset.page);
+  history.pushState(null, "", pageHref(page));
+  window.scrollTo(0, 0);
+  load(page);
+});
+
+window.addEventListener("popstate", () => load(pageFromUrl()));
+
+load(pageFromUrl());
 </script>
 </body>
 </html>

@@ -954,9 +954,9 @@ function newsRow(n) {
 
 async function loadNews() {
   try {
-    // Лента у админки и у страницы новостей одна и та же: отдельного
-    // админского списка нет, показывать в нём было бы нечего сверх этого.
-    const data = await api("GET", "/api/news");
+    // Своя лента, не публичная: та разбита на страницы по десять, а править
+    // нужно любую новость, а не только попавшую на первую страницу.
+    const data = await api("GET", "/api/admin/news");
     window.__news = data.news;
     el("count-news").textContent = data.news.length;
     el("news").innerHTML = data.news.length
