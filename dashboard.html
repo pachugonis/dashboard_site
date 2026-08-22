@@ -5,19 +5,42 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
 <title>onionwatch — доступность onion-сервисов</title>
+<script>
+  // Тема выбирается до первой отрисовки: иначе светлая страница успела бы
+  // мигнуть тёмной. Выбор пользователя лежит в localStorage; без выбора берём
+  // системный. Скрипт повторён на всех трёх страницах — общего файла тут нет.
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem("ow-theme"); } catch (e) { /* приватный режим */ }
+    var light = saved ? saved === "light"
+      : !!(window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches);
+    document.documentElement.dataset.theme = light ? "light" : "dark";
+  })();
+</script>
 <style>
+  /* Тёмная тема — та, с которой сайт начинался, и она же запасная: без
+     скрипта атрибута data-theme нет и остаются значения из :root. */
   :root {
+    color-scheme: dark;
     --ink: #0f1220;
     --panel: #161a2c;
     --panel-2: #1c2138;
     --line: #272d4a;
+    --line-hi: #3a4270;   /* рамка под курсором */
     --text: #e7e9f5;
     --muted: #949bc4;
     --dim: #5d6390;
+    --glow: #1d2244;      /* пятно света в углу страницы */
+    --on-accent: #12132a; /* текст поверх заливки акцентом */
+    --active-ink: #fff;   /* текущий раздел меню, нажатая кнопка */
     /* Статусные цвета: только состояние, всегда рядом со словом. */
     --up: #3ecfa0;
     --down: #ff5d73;
     --slow: #f2b64c;    /* не состояние: им подсвечивается просевший аптайм */
+    --up-wash: rgba(62,207,160,.09);
+    --down-wash: rgba(255,93,115,.08);
+    --up-ring: rgba(62,207,160,.16);
+    --down-ring: rgba(255,93,115,.16);
     /* Цвета данных в ленте: проверены validate_palette.js на панели #161a2c
        (полоса светлоты, CVD-разделение, контраст). Не путать со статусными. */
     --circuit: #8f7bff;
@@ -25,11 +48,38 @@
     --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
   }
+  /* Светлая тема — те же имена с другими значениями: правила ниже написаны
+     через переменные и про тему не знают. Цвета не осветлённые тёмные, а
+     подобранные заново: на белой панели зелёный #3ecfa0 даёт 1.9:1 и слово
+     «доступен» им не прочитать. Здесь у каждого не меньше 4.5:1. */
+  html[data-theme="light"] {
+    color-scheme: light;
+    --ink: #f2f4fb;
+    --panel: #fff;
+    --panel-2: #f1f3fb;
+    --line: #d9dcee;
+    --line-hi: #b3b8d8;
+    --text: #171a2e;
+    --muted: #545a80;
+    --dim: #63688c;
+    --glow: #e3e6fb;
+    --on-accent: #fff;
+    --active-ink: #3b23a8;
+    --up: #0b7856;
+    --down: #cf1f3c;
+    --slow: #96620a;
+    --up-wash: rgba(11,120,86,.08);
+    --down-wash: rgba(207,31,60,.07);
+    --up-ring: rgba(11,120,86,.18);
+    --down-ring: rgba(207,31,60,.18);
+    --circuit: #5b3fd6;
+    --svc: #10826a;
+  }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--ink); color: var(--text); font-family: var(--sans);
     font-size: 15px; line-height: 1.5;
-    background-image: radial-gradient(circle at 15% -10%, #1d2244 0%, transparent 55%);
+    background-image: radial-gradient(circle at 15% -10%, var(--glow) 0%, transparent 55%);
     background-attachment: fixed;
   }
   .wrap { max-width: 1320px; margin: 0 auto; padding: 28px 20px 64px; }
@@ -50,18 +100,30 @@
   .meta a { color: var(--muted); }
   .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block;
     margin-right: 7px; vertical-align: 1px; background: var(--dim); }
-  .dot.on { background: var(--up); box-shadow: 0 0 0 3px rgba(62,207,160,.16); }
-  .dot.off { background: var(--down); box-shadow: 0 0 0 3px rgba(255,93,115,.16); }
+  .dot.on { background: var(--up); box-shadow: 0 0 0 3px var(--up-ring); }
+  .dot.off { background: var(--down); box-shadow: 0 0 0 3px var(--down-ring); }
 
   /* Верхнее меню: одинаковое на всех страницах. */
-  nav.nav { display: flex; gap: 6px; flex-wrap: wrap; }
+  nav.nav { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
   nav.nav a { font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
     text-decoration: none; color: var(--muted); background: var(--panel);
     border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; }
-  nav.nav a:hover { background: var(--panel-2); border-color: #3a4270; color: var(--text); }
-  nav.nav a[aria-current="page"] { color: #fff; border-color: var(--circuit);
+  nav.nav a:hover { background: var(--panel-2); border-color: var(--line-hi); color: var(--text); }
+  nav.nav a[aria-current="page"] { color: var(--active-ink); border-color: var(--circuit);
     background: linear-gradient(var(--panel-2), var(--panel)); }
   nav.nav a[hidden] { display: none; }
+  /* Переключатель темы: квадрат ровно в высоту соседних ссылок (18px строки
+     плюс 7+7 отступа плюс рамка). Иконка показывает, куда переключит, а не
+     что включено сейчас: нажимают ради второго состояния. */
+  nav.nav .theme { width: 34px; height: 34px; padding: 0; flex: none; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--muted); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; }
+  nav.nav .theme:hover { background: var(--panel-2); border-color: var(--line-hi); color: var(--text); }
+  nav.nav .theme svg { width: 16px; height: 16px; display: block; }
+  nav.nav .theme .i-moon { display: none; }
+  html[data-theme="light"] nav.nav .theme .i-sun { display: none; }
+  html[data-theme="light"] nav.nav .theme .i-moon { display: block; }
 
   /* Сводка: три числа, которыми дашборд открывается. */
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -83,8 +145,8 @@
   input[type=search] { min-width: 220px; flex: 1 1 220px; font-family: var(--mono); }
   input[type=search]::placeholder { color: var(--dim); }
   .btn { cursor: pointer; text-decoration: none; display: inline-block; }
-  .btn:hover { background: var(--panel-2); border-color: #3a4270; }
-  .btn[aria-pressed="true"] { border-color: var(--circuit); color: #fff;
+  .btn:hover { background: var(--panel-2); border-color: var(--line-hi); }
+  .btn[aria-pressed="true"] { border-color: var(--circuit); color: var(--active-ink);
     background: linear-gradient(var(--panel-2), var(--panel)); }
   :focus-visible { outline: 2px solid var(--circuit); outline-offset: 2px; }
 
@@ -122,7 +184,7 @@
     text-decoration: none; color: var(--text); background: var(--panel-2);
     border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px;
     font-family: var(--mono); font-size: 11.5px; }
-  .addr:hover { border-color: #3a4270; }
+  .addr:hover { border-color: var(--line-hi); }
   .addr .kind { flex: none; font-size: 9px; letter-spacing: .1em;
     text-transform: uppercase; color: var(--dim); border: 1px solid var(--line);
     border-radius: 4px; padding: 1px 5px; }
@@ -175,7 +237,7 @@
   .empty-state { border: 1px dashed var(--line); border-radius: 12px; padding: 44px 24px;
     text-align: center; color: var(--muted); grid-column: 1 / -1; }
   .empty-state a { color: var(--circuit); }
-  .banner { border: 1px solid var(--down); background: rgba(255,93,115,.08);
+  .banner { border: 1px solid var(--down); background: var(--down-wash);
     border-radius: 10px; padding: 12px 16px; margin-bottom: 16px; font-size: 14px; }
   footer { margin-top: 26px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
 
@@ -197,6 +259,17 @@
         <a href="/" aria-current="page">Дашборд</a>
         <a href="/news">Новости</a>
         <a href="/admin" data-admin hidden>Админка</a>
+        <button type="button" class="theme" id="theme">
+          <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4.2"/>
+            <path d="M12 2.3v2.3M12 19.4v2.3M4.2 4.2l1.7 1.7M18.1 18.1l1.7 1.7M2.3 12h2.3M19.4 12h2.3M4.2 19.8l1.7-1.7M18.1 5.9l1.7-1.7"/>
+          </svg>
+          <svg class="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20.5 14.6A8.6 8.6 0 0 1 9.4 3.5a8.6 8.6 0 1 0 11.1 11.1Z"/>
+          </svg>
+        </button>
       </nav>
       <div class="meta" id="meta"></div>
     </div>
@@ -432,6 +505,25 @@ async function navForAdmin() {
     for (const a of document.querySelectorAll("nav.nav a[data-admin]")) a.hidden = false;
   } catch (e) { /* не ответили — ссылка на админку просто не появится */ }
 }
+
+// Переключатель темы. Выбор запоминается и переживает перезагрузку; пока его
+// не сделали, страница идёт за системной темой (см. скрипт в head).
+(function () {
+  const root = document.documentElement, btn = el("theme");
+  const sync = () => {
+    const light = root.dataset.theme === "light";
+    const to = light ? "тёмную" : "светлую";
+    btn.setAttribute("aria-pressed", String(light));
+    btn.setAttribute("aria-label", "Переключить на " + to + " тему");
+    btn.title = "Переключить на " + to + " тему";
+  };
+  btn.addEventListener("click", () => {
+    root.dataset.theme = root.dataset.theme === "light" ? "dark" : "light";
+    try { localStorage.setItem("ow-theme", root.dataset.theme); } catch (e) { /* приватный режим */ }
+    sync();
+  });
+  sync();
+})();
 
 navForAdmin();
 load(); schedule();

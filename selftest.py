@@ -669,6 +669,34 @@ async def main() -> int:
         check(f"{page}: в меню есть ссылка на новости",
               'href="/news"' in text and "Новости" in text, True)
 
+    # Тема тоже заведена руками в трёх файлах: кнопка в меню, набор переменных
+    # под светлую тему и выбор темы до первой отрисовки. Забыть одно из трёх на
+    # одной странице — получить либо страницу без переключателя, либо тёмную
+    # вспышку при загрузке, и ни то, ни другое серверные тесты не видят.
+    for page, text in pages.items():
+        check(f"{page}: в меню есть переключатель темы",
+              'class="theme" id="theme"' in text, True)
+        check(f"{page}: светлая тема описана",
+              'html[data-theme="light"]' in text, True)
+        # Скрипт обязан стоять в head: ниже по документу он уже опоздает.
+        head = text.split("</head>")[0]
+        check(f"{page}: тема выбирается до отрисовки",
+              "ow-theme" in head and "prefers-color-scheme" in head, True)
+
+    # Цвета светлой темы правятся отдельно на каждой странице, и разъехаться им
+    # проще всего. Общие переменные обязаны совпадать по всем трём файлам.
+    def light_vars(text):
+        block = re.search(r'html\[data-theme="light"\] \{(.*?)\n  \}', text, re.S)
+        return dict(re.findall(r"--([\w-]+):\s*([^;]+);", block.group(1))) if block else {}
+    themes = {p: light_vars(t) for p, t in pages.items()}
+    shared = set.intersection(*(set(v) for v in themes.values()))
+    check("светлая тема одинаковая на всех страницах",
+          all(themes[p][k] == themes["dashboard.html"][k] for p in themes for k in shared),
+          True)
+    # Панель светлой темы обязана быть светлее текста, иначе тему перепутали.
+    check("в светлой теме панель светлее текста",
+          themes["dashboard.html"]["panel"].strip() == "#fff", True)
+
     # Вкладки админки: цели и новости. Их переключение — целиком в браузере,
     # серверу о них знать нечего, поэтому проверяем разметку.
     check("в админке две вкладки",
