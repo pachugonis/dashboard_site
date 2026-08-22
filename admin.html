@@ -144,7 +144,7 @@
     </div>
     <div class="top-right">
       <nav class="nav" aria-label="Разделы">
-        <a href="/" data-admin hidden>Дашборд</a>
+        <a href="/">Дашборд</a>
         <a href="/news">Новости</a>
         <a href="/admin" aria-current="page" data-admin hidden>Админка</a>
       </nav>
@@ -621,8 +621,7 @@ async function api(method, url, body) {
 function show(authed) {
   el("login-view").classList.toggle("hidden", authed);
   el("admin-view").classList.toggle("hidden", !authed);
-  // Обычный посетитель видит в меню только «Новости»: дашборд и админка
-  // появляются лишь после входа под админом.
+  // Дашборд и новости открыты всем, ссылка на админку — только вошедшему.
   for (const a of document.querySelectorAll("nav.nav a[data-admin]")) a.hidden = !authed;
 }
 

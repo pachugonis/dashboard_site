@@ -116,7 +116,7 @@
     </div>
     <div class="top-right">
       <nav class="nav" aria-label="Разделы">
-        <a href="/" data-admin hidden>Дашборд</a>
+        <a href="/">Дашборд</a>
         <a href="/news" aria-current="page">Новости</a>
         <a href="/admin" data-admin hidden>Админка</a>
       </nav>
@@ -248,14 +248,14 @@ el("pager").addEventListener("click", ev => {
 
 window.addEventListener("popstate", () => load(pageFromUrl()));
 
-// Обычный посетитель видит в меню только «Новости»: дашборд и админка
-// появляются, когда /api/session подтверждает вход под админом.
+// Дашборд и новости открыты всем, ссылка на админку появляется, только когда
+// /api/session подтверждает вход.
 async function navForAdmin() {
   try {
     const s = await (await fetch("/api/session", { cache: "no-store" })).json();
     if (!s.authed) return;
     for (const a of document.querySelectorAll("nav.nav a[data-admin]")) a.hidden = false;
-  } catch (e) { /* не ответили — меню просто останется без админских ссылок */ }
+  } catch (e) { /* не ответили — ссылка на админку просто не появится */ }
 }
 
 navForAdmin();
