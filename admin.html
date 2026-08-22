@@ -52,6 +52,12 @@
   .fields { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
   .fields .wide { grid-column: 1 / -1; }
   .hint { font-size: 12px; color: var(--dim); margin-top: 5px; }
+  /* Список onion-адресов: строка ввода плюс кнопка «убрать». */
+  .onion-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .onion-row input { flex: 1 1 auto; min-width: 0;
+    font-family: var(--mono); font-size: 12.5px; }
+  .onion-row button { flex: none; padding: 8px 11px; color: var(--muted); }
+  .onion-row button:hover { color: var(--down); }
   .actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
   .check { display: flex; align-items: center; gap: 8px; }
   .check input { width: auto; }
@@ -66,6 +72,8 @@
   .t-name { font-weight: 600; }
   .t-url { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
     word-break: break-all; }
+  .t-url .kind { color: var(--dim); font-size: 9px; letter-spacing: .1em;
+    text-transform: uppercase; margin-right: 6px; }
   /* Параметры проверки ломать по символам нельзя — «60 с» уезжает на две строки. */
   td.spec { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
     white-space: nowrap; width: 1%; }
@@ -136,11 +144,21 @@
       <h2 id="form-title">Новая цель</h2>
       <div class="fields">
         <div class="wide">
-          <label for="f-url">Адрес onion-сервиса</label>
-          <input id="f-url" placeholder="http://xxxxxxxx…xxxx.onion/" autocapitalize="off" spellcheck="false">
+          <label for="f-clear">Обычный адрес (clear)</label>
+          <input id="f-clear" placeholder="https://example.com/" autocapitalize="off" spellcheck="false">
+          <div class="hint">Не обязателен, и он один: зеркало сервиса в обычной
+            сети. Проверяется тоже через Tor — с выходом через exit-узел.</div>
+        </div>
+        <div class="wide">
+          <label>Onion-адреса — до <span id="f-onion-max">10</span></label>
+          <div id="f-onions"></div>
+          <div class="actions">
+            <button type="button" id="f-onion-add">Добавить onion-адрес</button>
+          </div>
           <div class="hint">v3-адрес: 56 символов a–z и 2–7, затем .onion.
             Берите его из официального источника сервиса и копируйте целиком —
-            ошибка в одном символе указывает на другой сервис.</div>
+            ошибка в одном символе указывает на другой сервис. Первый адрес
+            в списке становится главным, если обычного нет.</div>
         </div>
         <div>
           <label for="f-name">Имя</label>
@@ -161,13 +179,13 @@
           <label for="f-timeout">Таймаут, с</label>
           <input id="f-timeout" inputmode="numeric" placeholder="по умолчанию">
         </div>
-        <div>
-          <label for="f-status">Ожидаемые коды</label>
-          <input id="f-status" placeholder="200, 301">
-        </div>
-        <div>
+        <div class="wide">
           <label for="f-text">Строка в ответе</label>
           <input id="f-text" placeholder="необязательно">
+          <div class="hint">Единственное условие сверх «сервис ответил»: если
+            строка задана, а в успешном ответе её нет, адрес считается
+            недоступным. Код ответа сам по себе на доступность не влияет —
+            503 и капча значат «работает, но придерживает».</div>
         </div>
         <div class="wide">
           <label for="f-note">Заметка</label>
@@ -234,9 +252,16 @@
 <script>
 const el = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let editing = null, defaults = { interval: 300, timeout: 60 };
+let editing = null, defaults = { interval: 300, timeout: 60 }, maxOnions = 10;
 // Картинка, выбранная в форме, но ещё не сохранённая, и флаг «удалить имеющуюся».
 let pendingImage = null, clearImage = false, pendingFile = null;
+
+// «1 адрес», «2 адреса», «5 адресов» — форма зависит от последних цифр.
+function plural(n, one, few, many) {
+  const t = n % 100, u = n % 10;
+  const word = (t >= 11 && t <= 14) ? many : u === 1 ? one : (u >= 2 && u <= 4) ? few : many;
+  return `${n} ${word}`;
+}
 
 const IMG_SIZE = 256;          // сторона квадрата, который уходит на сервер
 const IMG_MAX_CHARS = 690000;  // потолок сервера — 512 КБ, это они же в base64
@@ -389,7 +414,7 @@ async function boot() {
     : "Администратор ещё не создан. Выполните на сервере: "
       + "python3 onionwatch.py --config <конфиг> --set-admin admin";
   show(s.authed);
-  if (s.authed) { showThumb(null); loadTargets(); }
+  if (s.authed) { showThumb(null); setOnions([]); loadTargets(); }
 }
 
 // -- вход ------------------------------------------------------------------
@@ -415,6 +440,9 @@ for (const id of ["l-login", "l-pass"]) {
 // -- список целей ----------------------------------------------------------
 
 function targetRow(t) {
+  const addrs = (t.addresses || [{ kind: "onion", url: t.url }]).map(a =>
+    `<div class="t-url"><span class="kind">${a.kind === "clear" ? "clear" : "onion"}</span>${esc(a.url)}</div>`
+  ).join("");
   return `<tr>
     <td>
       <div class="t-head">
@@ -423,14 +451,14 @@ function targetRow(t) {
           : ""}
         <div style="min-width:0">
           <div class="t-name">${esc(t.name)}</div>
-          <div class="t-url">${esc(t.url)}</div>
+          ${addrs}
           ${t.note ? `<div class="t-url">${esc(t.note)}</div>` : ""}
         </div>
       </div>
     </td>
     <td><span class="tag ${t.enabled ? "on" : "off"}">${t.enabled ? "проверяется" : "выключена"}</span></td>
     <td class="spec">${esc(t.mode)} · ${Math.round(t.interval/60)} мин · ${Math.round(t.timeout)} с<br>
-        ${t.mode === "http" ? esc(t.expect_status.join(", ")) : "поток"}${t.expect_text ? " · «" + esc(t.expect_text) + "»" : ""}</td>
+        ${plural((t.addresses || []).length, "адрес", "адреса", "адресов")}${t.expect_text ? " · «" + esc(t.expect_text) + "»" : ""}</td>
     <td class="act">
       <button data-edit="${t.id}">Изменить</button>
       <button class="danger" data-del="${t.id}" data-name="${esc(t.name)}">Удалить</button>
@@ -442,6 +470,8 @@ async function loadTargets() {
   try {
     const data = await api("GET", "/api/admin/targets");
     defaults = data.defaults;
+    maxOnions = data.max_onions || maxOnions;
+    el("f-onion-max").textContent = String(maxOnions);
     el("f-interval").placeholder = `по умолчанию ${defaults.interval}`;
     el("f-timeout").placeholder = `по умолчанию ${Math.round(defaults.timeout)}`;
     window.__targets = data.targets;
@@ -456,16 +486,64 @@ async function loadTargets() {
   }
 }
 
+// -- адреса ----------------------------------------------------------------
+
+// Строки onion-адресов живут прямо в DOM: значение поля и есть состояние,
+// отдельный массив пришлось бы синхронизировать с ним на каждое нажатие.
+function onionRow(url) {
+  const row = document.createElement("div");
+  row.className = "onion-row";
+  const input = document.createElement("input");
+  input.className = "onion";
+  input.placeholder = "http://xxxxxxxx…xxxx.onion/";
+  input.autocapitalize = "off";
+  input.spellcheck = false;
+  input.value = url || "";
+  const drop = document.createElement("button");
+  drop.type = "button";
+  drop.textContent = "✕";
+  drop.title = "Убрать адрес";
+  drop.addEventListener("click", () => {
+    row.remove();
+    if (!el("f-onions").children.length) addOnion("");
+    syncOnionButton();
+  });
+  row.append(input, drop);
+  return row;
+}
+
+function addOnion(url) {
+  el("f-onions").append(onionRow(url));
+  syncOnionButton();
+}
+
+function syncOnionButton() {
+  el("f-onion-add").disabled = el("f-onions").children.length >= maxOnions;
+}
+
+function setOnions(urls) {
+  el("f-onions").innerHTML = "";
+  for (const url of (urls.length ? urls : [""]).slice(0, maxOnions)) addOnion(url);
+}
+
+function onionValues() {
+  return [...el("f-onions").querySelectorAll("input.onion")]
+    .map(i => i.value.trim()).filter(Boolean);
+}
+
+el("f-onion-add").addEventListener("click", () => addOnion(""));
+
 // -- форма -----------------------------------------------------------------
 
 function fillForm(t) {
   editing = t ? t.id : null;
-  el("f-url").value = t ? t.url : "";
+  const addrs = (t && t.addresses) || [];
+  el("f-clear").value = (addrs.find(a => a.kind === "clear") || {}).url || "";
+  setOnions(addrs.filter(a => a.kind === "onion").map(a => a.url));
   el("f-name").value = t ? t.name : "";
   el("f-mode").value = t ? t.mode : "http";
   el("f-interval").value = t && t.interval !== defaults.interval ? t.interval : "";
   el("f-timeout").value = t && t.timeout !== defaults.timeout ? t.timeout : "";
-  el("f-status").value = t ? t.expect_status.join(", ") : "";
   el("f-text").value = t ? (t.expect_text || "") : "";
   el("f-note").value = t ? t.note : "";
   el("f-enabled").checked = t ? t.enabled : true;
@@ -479,17 +557,19 @@ function fillForm(t) {
   el("f-save").textContent = t ? "Сохранить" : "Добавить";
   el("f-cancel").classList.toggle("hidden", !t);
   say("f-msg", "", "");
-  if (t) el("f-url").scrollIntoView({ behavior: "smooth", block: "center" });
+  if (t) el("f-clear").scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
 function formData() {
+  const clear = el("f-clear").value.trim();
+  const onions = onionValues();
   return {
-    name: el("f-name").value.trim() || el("f-url").value.trim(),
-    url: el("f-url").value.trim(),
+    name: el("f-name").value.trim() || clear || onions[0] || "",
+    clear,
+    onions,
     mode: el("f-mode").value,
     interval: el("f-interval").value.trim(),
     timeout: el("f-timeout").value.trim(),
-    expect_status: el("f-status").value.trim() || "200",
     expect_text: el("f-text").value.trim(),
     note: el("f-note").value.trim(),
     enabled: el("f-enabled").checked,

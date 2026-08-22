@@ -17,7 +17,7 @@
     /* Статусные цвета: только состояние, всегда рядом со словом. */
     --up: #3ecfa0;
     --down: #ff5d73;
-    --slow: #f2b64c;
+    --slow: #f2b64c;    /* не состояние: им подсвечивается просевший аптайм */
     /* Цвета данных в ленте: проверены validate_palette.js на панели #161a2c
        (полоса светлоты, CVD-разделение, контраст). Не путать со статусными. */
     --circuit: #8f7bff;
@@ -62,7 +62,6 @@
   .kpi .k { font-family: var(--mono); font-size: 10px; letter-spacing: .14em;
     text-transform: uppercase; color: var(--dim); margin-top: 4px; }
   .kpi.ok .v { color: var(--up); } .kpi.bad .v { color: var(--down); }
-  .kpi.warn .v { color: var(--slow); }
   .kpi.wait .v { color: var(--muted); }
 
   .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 18px 0 16px; }
@@ -85,7 +84,6 @@
     border-top: 3px solid var(--dim); border-radius: 12px; padding: 16px 18px 14px;
     display: flex; flex-direction: column; gap: 12px; min-width: 0; }
   .card.up { border-top-color: var(--up); }
-  .card.warn { border-top-color: var(--slow); }
   .card.down { border-top-color: var(--down); }
   .card.pending { border-top-color: var(--dim); }
 
@@ -97,15 +95,35 @@
     object-fit: contain; border: 1px solid var(--line); background: var(--panel-2); }
   .name { font-weight: 600; font-size: 16px; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
-  .addr { font-family: var(--mono); font-size: 11.5px; color: var(--muted);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .kinds { font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
   /* Статус — цвет плюс слово: по одному цвету состояние читать нельзя. */
   .pill { font-family: var(--mono); font-size: 10px; letter-spacing: .08em;
     text-transform: uppercase; padding: 3px 7px; border-radius: 5px;
     border: 1px solid currentColor; white-space: nowrap; flex: none; }
   .up .pill { color: var(--up); } .down .pill { color: var(--down); }
-  .warn .pill { color: var(--slow); }
   .pending .pill { color: var(--dim); }
+
+  /* Адреса цели: обычный и onion-зеркала. Каждый — ссылка в новое окно
+     и собственное состояние; никаких причин, только доступен или нет. */
+  .addrs { display: flex; flex-direction: column; gap: 6px; }
+  .addr { display: flex; align-items: center; gap: 8px; min-width: 0;
+    text-decoration: none; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 9px;
+    font-family: var(--mono); font-size: 11.5px; }
+  .addr:hover { border-color: #3a4270; }
+  .addr .kind { flex: none; font-size: 9px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 5px; }
+  /* Хэш onion не переносится ни по чему: режем по ширине, целиком — в подсказке. */
+  .addr .host { flex: 1 1 auto; min-width: 0; color: var(--muted);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .addr .mark { flex: none; font-size: 9px; letter-spacing: .1em;
+    text-transform: uppercase; }
+  .addr.up .mark { color: var(--up); }
+  .addr.down .mark { color: var(--down); }
+  .addr.pending .mark { color: var(--dim); }
+  .addr .go { flex: none; color: var(--dim); }
+  .addr:hover .go { color: var(--circuit); }
 
   .figures { display: flex; align-items: baseline; gap: 18px; }
   .fig .v { font-size: 30px; font-weight: 600; font-variant-numeric: tabular-nums;
@@ -125,9 +143,6 @@
   .tick i { display: block; border-radius: 2px 2px 0 0; }
   .tick .svc { background: var(--svc); margin-bottom: 2px; border-radius: 2px; }
   .tick .cir { background: var(--circuit); }
-  /* Ответ с оговоркой: цепочка построена и время ответа настоящее, поэтому
-     штрих остаётся обычным — жёлтой становится верхняя часть, а не весь он. */
-  .tick.warn .svc { background: var(--slow); }
   .tick.bad i { background: var(--down); border-radius: 2px 2px 0 0; }
   .tick.empty i { background: var(--line); }
   .legend { font-family: var(--mono); font-size: 10px; color: var(--dim);
@@ -137,14 +152,7 @@
   .legend .sw { display: inline-block; width: 7px; height: 7px; border-radius: 2px;
     margin-right: 4px; vertical-align: 0; }
 
-  .err { font-size: 12.5px; color: var(--down); }
-  .caveat { font-size: 12.5px; color: var(--slow); }
   .note { font-size: 12.5px; color: var(--dim); }
-  /* Ссылка из Location — один сплошной токен: переносить её не по чему, и
-     карточку распирает. Onion-адрес внутри сокращается в коде, а остаток
-     режется по ширине; целиком строка видна в подсказке. */
-  .redirect { font-size: 12.5px; color: var(--dim);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .foot-row { display: flex; align-items: center; justify-content: space-between;
     gap: 10px; margin-top: auto; padding-top: 4px; }
   .when { font-family: var(--mono); font-size: 11px; color: var(--dim); }
@@ -209,15 +217,12 @@ const ago = ts => {
 };
 const clock = ts => new Date(ts*1000).toLocaleTimeString("ru-RU");
 const grade = v => v == null ? "none" : v >= 99 ? "good" : v >= 95 ? "warn" : "bad";
-// Три состояния: сервис ответил как ждали, ответил не тем, или не ответил
-// вовсе. У записей, сделанных до появления третьего, поля state нет.
-const stateOf = h => h.state || (h.ok ? "up" : "down");
-const WORD = { up: "доступен", warn: "с оговоркой", down: "недоступен", pending: "в очереди" };
-// Хэш onion-адреса — 56 знаков, в строке он вытесняет всё остальное, включая
-// путь, ради которого её и показывают. Сокращаем так же, как host у цели:
-// начало, многоточие, хвост (см. Target.label).
-const shortOnion = s => String(s ?? "").replace(
-  /([a-z2-7]{56})\.onion/gi, (_, h) => `${h.slice(0, 8)}…${h.slice(-8)}.onion`);
+// Состояния два: до сервиса достучались или нет. У записей, сделанных до
+// появления поля state, его нет, а до перехода на два состояния там могло
+// стоять 'warn' — «ответил не тем», что теперь считается доступностью.
+const stateOf = h => !h ? "pending"
+  : (h.state ? h.state === "down" : !h.ok) ? "down" : "up";
+const WORD = { up: "доступен", down: "недоступен", pending: "в очереди" };
 
 function tape(history) {
   const slots = 60;
@@ -233,8 +238,7 @@ function tape(history) {
     const tries = (h.attempts || 1) > 1 ? ` · попыток: ${h.attempts}` : "";
     const st = stateOf(h);
     if (st === "down") {
-      const why = h.error || h.error_slug || "недоступен";
-      return `<span class="tick bad" title="${esc(when + " — сбой: " + why + tries)}"><i style="height:100%"></i></span>`;
+      return `<span class="tick bad" title="${esc(when + " — недоступен" + tries)}"><i style="height:100%"></i></span>`;
     }
     const circuit = h.connect_ms || 0;
     const scale = v => Math.max(2, Math.min(100, Math.round(100 * v / worst)));
@@ -242,41 +246,40 @@ function tape(history) {
     // В режиме tcp ответа нет вообще (ttfb_ms пуст) — рисуем только цепочку,
     // иначе зелёная полоска обозначала бы несуществующее время ответа.
     const svc = h.ttfb_ms == null ? null : Math.max(0, h.ttfb_ms - circuit);
-    let hs = svc ? Math.min(100 - hc, scale(svc)) : 0;
-    // Оговорку видно и при мгновенном ответе: иначе жёлтой части не осталось бы.
-    if (st === "warn") hs = Math.max(hs, 3);
-    // У оговорки и у редиректа вместо кода ответа пишем причину: она его и
-    // называет, а когда дело в теле ответа — код сам по себе ничего не объясняет.
-    const lead = (st === "warn" || h.error_slug === "redirect")
-      ? (h.error || "ответ не тот, которого ждали")
-      : svc == null ? "поток открыт" : `HTTP ${h.status ?? "ok"}`;
+    const hs = svc ? Math.min(100 - hc, scale(svc)) : 0;
     const timings = svc == null ? `цепочка ${ms(circuit)}`
       : `цепочка ${ms(circuit)} · ответ ${ms(svc)}`;
-    const tip = `${when} — ${lead} · ${timings}${tries}`;
+    const tip = `${when} — доступен · ${timings}${tries}`;
     return `<span class="tick ${st}" title="${esc(tip)}">`
          + (hs ? `<i class="svc" style="height:${hs}%"></i>` : "")
          + `<i class="cir" style="height:${hc}%"></i></span>`;
   }).join("");
 }
 
+// Строка адреса: вид, сам адрес, состояние и переход по ссылке. Открывается
+// в новом окне — noopener и no-referrer, чтобы страница по ту сторону не
+// узнала, откуда пришли, и не дотянулась до дашборда.
+function addrRow(a) {
+  const st = stateOf(a.last);
+  return `<a class="addr ${st}" href="${esc(a.url)}" target="_blank"
+     rel="noopener noreferrer" title="${esc(a.url)}"
+     aria-label="${esc(a.url)} — ${WORD[st]}, откроется в новом окне">
+    <span class="kind">${a.kind === "clear" ? "clear" : "onion"}</span>
+    <span class="host">${esc(a.label)}</span>
+    <span class="mark">${WORD[st]}</span>
+    <span class="go" aria-hidden="true">↗</span>
+  </a>`;
+}
+
 function card(t) {
-  const last = t.last;
-  const status = !last ? "pending" : stateOf(last);
-  const word = WORD[status];
+  const addrs = t.addresses || [];
+  // Цель доступна, пока отвечает хоть один адрес: зеркала на то и заводят.
+  const status = stateOf(t.last);
   const d = t.day, w = t.week;
-  // Оговорка — это «сервис на связи, но отдал не то»: причина та же, что у
-  // сбоя, а вес другой, поэтому и цвет другой, и формулировка не про падение.
-  // Редирект зелёный, но куда он ведёт — сказать стоит: за ним капча, и
-  // expect_text по такой цели уже не проверяется.
-  const detail = !last ? ""
-    : last.error_slug === "redirect"
-      ? `<div class="redirect" title="${esc(last.error)}">${esc(shortOnion(last.error))}</div>`
-    : status === "up" ? ""
-    : status === "warn"
-      ? `<div class="caveat">Сервис на связи · ${esc(last.error || "ответ не тот, которого ждали")}</div>`
-      : `<div class="err">${esc(last.error || "недоступен")}</div>`;
   const note = t.note ? `<div class="note">${esc(t.note)}</div>` : "";
-  const port = (t.port !== 80 && t.port !== 443) ? ":" + t.port : "";
+  const onions = addrs.filter(a => a.kind === "onion").length;
+  const kinds = [addrs.length > onions ? "1 обычный" : "",
+                 onions ? `${onions} onion` : ""].filter(Boolean).join(" · ");
   return `<article class="card ${status}" data-name="${esc(t.name)}">
     <div class="head">
       <div class="ident">
@@ -285,10 +288,10 @@ function card(t) {
           : ""}
         <div style="min-width:0">
           <div class="name" title="${esc(t.name)}">${esc(t.name)}</div>
-          <div class="addr" title="${esc(t.url)}">${esc(t.host)}${port}</div>
+          <div class="kinds">${esc(kinds)}</div>
         </div>
       </div>
-      <span class="pill">${word}</span>
+      <span class="pill">${WORD[status]}</span>
     </div>
 
     <div class="figures">
@@ -302,19 +305,21 @@ function card(t) {
       </div>
     </div>
 
-    ${detail}${note}
+    <div class="addrs">${addrs.map(addrRow).join("")}</div>
+
+    ${note}
 
     <div>
       <div class="tape">${tape(t.history)}</div>
       <div class="legend">
         <span><span class="sw" style="background:var(--circuit)"></span>цепочка <b>${ms(d.avg_circuit_ms)}</b></span>
         <span><span class="sw" style="background:var(--svc)"></span>ответ <b>${ms(d.avg_ttfb_ms)}</b></span>
-        <span>${d.checks} проверок${d.warn ? ` · ${d.warn} с оговоркой` : ""}</span>
+        <span>${d.checks} проверок</span>
       </div>
     </div>
 
     <div class="foot-row">
-      <span class="when">${last ? esc(ago(last.ts)) : "ещё не проверялся"} · раз в ${Math.round(t.interval/60)} мин</span>
+      <span class="when">${t.last ? esc(ago(t.last.ts)) : "ещё не проверялся"} · раз в ${Math.round(t.interval/60)} мин</span>
       <button class="btn recheck" data-name="${esc(t.name)}" ${t.checking ? "disabled" : ""}>
         ${t.checking ? "проверяю…" : "Проверить"}
       </button>
@@ -326,9 +331,14 @@ function render() {
   if (!state) return;
   const q = el("filter").value.trim().toLowerCase();
   let list = state.targets;
-  if (q) list = list.filter(t => (t.name + " " + t.host).toLowerCase().includes(q));
-  // Оговорка — тоже повод посмотреть на цель, поэтому фильтр ловит и её.
-  if (onlyBad) list = list.filter(t => t.last && stateOf(t.last) !== "up");
+  // Фильтр ищет по всем адресам цели, а не только по главному: зеркало помнят
+  // не хуже основного адреса.
+  if (q) list = list.filter(t => (t.name + " " + (t.addresses || [])
+    .map(a => a.url).join(" ")).toLowerCase().includes(q));
+  // Проблемной считаем и цель, у которой упало одно зеркало из нескольких:
+  // сервис ещё жив, но повод посмотреть уже есть.
+  if (onlyBad) list = list.filter(t => t.last && (t.addresses || [])
+    .some(a => stateOf(a.last) === "down"));
 
   el("meta").innerHTML =
     `<span><span class="dot ${state.tor_ok ? "on" : "off"}"></span>tor ${esc(state.tor_socks)}</span>`
@@ -336,7 +346,6 @@ function render() {
 
   el("kpis").innerHTML = state.total ? [
     `<div class="kpi ok"><div class="v">${state.up}</div><div class="k">доступно</div></div>`,
-    `<div class="kpi warn"><div class="v">${state.warn ?? 0}</div><div class="k">с оговоркой</div></div>`,
     `<div class="kpi bad"><div class="v">${state.down}</div><div class="k">недоступно</div></div>`,
     `<div class="kpi wait"><div class="v">${state.pending}</div><div class="k">ещё не проверялись</div></div>`,
   ].join("") : "";

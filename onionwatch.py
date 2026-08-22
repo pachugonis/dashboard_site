@@ -2,8 +2,9 @@
 """
 onionwatch — монитор доступности onion-сервисов (Tor hidden services).
 
-Проверяет каждый адрес через SOCKS5-порт локального Tor, пишет историю
-в SQLite и отдаёт веб-дашборд + JSON API. Цели заводятся в админке
+У цели может быть несколько адресов: один обычный (clear) и до десяти onion.
+Каждый проверяется отдельно через SOCKS5-порт локального Tor, история пишется
+в SQLite, наружу отдаётся веб-дашборд + JSON API. Цели заводятся в админке
 (вход по логину и паролю), конфиг задаёт только инфраструктуру.
 
 Зависимости: только стандартная библиотека Python 3.11+ и запущенный tor.
@@ -72,16 +73,6 @@ RETRY_SLUGS = frozenset({
     "net_unreachable", "host_unreachable", "ttl_expired",
     "descriptor_not_found", "intro_failed", "intro_timeout", "rendezvous_failed",
 })
-# Коды, которыми анти-DDoS отвечает под нагрузкой или на первый запрос без
-# cookie: сервис жив, нас просто придержали. Стабильные 404 и 410 не повторяем.
-RETRY_STATUS = frozenset({403, 429, 500, 502, 503, 504})
-
-# Редиректы считаются нормальным ответом: именно так встречает капча, и цель за
-# ней доступна ровно так же, как при открытии в браузере. По редиректу мы не
-# идём — важно, что сервис на связи и отвечает осмысленно. 304 сюда не входит:
-# условных запросов мы не шлём, и «не изменилось» в ответ означает сломанный
-# сервер, а не переадресацию.
-REDIRECTS = frozenset({301, 302, 303, 307, 308})
 
 # Коды ответа SOCKS5: стандартные (RFC 1928) + расширения Tor (prop304).
 # Расширенные коды 0xF0–0xF7 Tor присылает, только если в torrc у SocksPort
@@ -110,6 +101,7 @@ SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "dklen": 32, "maxmem": 64 * 1024 * 1024}
 
 ONION_V3 = re.compile(r"^[a-z2-7]{56}\.onion$")
 NAME_RE = re.compile(r"^[^/\\\x00-\x1f]{1,64}$")
+MAX_ONIONS = 10               # сколько onion-зеркал можно завести одной цели
 MAX_BODY = 1024 * 1024        # в теле может приехать картинка в base64
 MAX_IMAGE = 512 * 1024
 
@@ -146,20 +138,18 @@ class Invalid(ValueError):
 # --------------------------------------------------------------------------
 
 @dataclass
-class Target:
-    name: str
+class Address:
+    """Один адрес сервиса. У цели их может быть несколько — это зеркала.
+
+    Обычный адрес и onion различаются только именем хоста, поэтому вид (kind)
+    не хранится, а выводится из него: ошибиться и завести onion как clear
+    нельзя в принципе. Ходим мы и туда и туда через тот же SOCKS Tor: для
+    обычного адреса это просто выход через exit-узел.
+    """
     url: str
-    interval: int = 300
-    timeout: float = 60.0
-    expect_status: list[int] = field(default_factory=lambda: [200])
-    expect_text: str | None = None
-    mode: str = "http"          # http | tcp
-    note: str = ""
     id: int = 0
-    enabled: bool = True
-    has_image: bool = False
-    updated_at: float = 0.0
     # разобранный url
+    kind: str = "onion"         # onion | clear
     host: str = ""
     port: int = 80
     path: str = "/"
@@ -174,14 +164,48 @@ class Target:
         if u.query:
             self.path += "?" + u.query
         if not self.host:
-            raise Invalid(f"{self.name}: не удалось разобрать адрес {self.url!r}")
+            raise Invalid(f"Не удалось разобрать адрес {self.url!r}")
+        self.kind = "onion" if self.host.endswith(".onion") else "clear"
 
     @property
     def label(self) -> str:
+        """Короткая подпись для карточки: хэш onion в неё целиком не влезает."""
         h = self.host
         if len(h) > 22 and h.endswith(".onion"):
             h = h[:8] + "…" + h[-14:]
-        return h
+        return h if self.port in (80, 443) else f"{h}:{self.port}"
+
+
+@dataclass
+class Target:
+    name: str
+    addresses: list[Address] = field(default_factory=list)
+    interval: int = 300
+    timeout: float = 60.0
+    expect_text: str | None = None
+    mode: str = "http"          # http | tcp
+    note: str = ""
+    id: int = 0
+    enabled: bool = True
+    has_image: bool = False
+    updated_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not self.addresses:
+            raise Invalid(f"{self.name}: у цели нет ни одного адреса")
+
+    @property
+    def primary(self) -> Address:
+        """Главный адрес: обычный, если он есть, иначе первый onion.
+
+        Порядок задаётся при сохранении, здесь он уже готов. По этому адресу
+        считаются тайминги в ленте — чтобы полоска не прыгала между зеркалами.
+        """
+        return self.addresses[0]
+
+    @property
+    def url(self) -> str:
+        return self.primary.url
 
 
 @dataclass
@@ -242,15 +266,14 @@ def load_config(path: str) -> Config:
 # Валидация целей
 # --------------------------------------------------------------------------
 
-def clean_target(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
-    """Приводит форму админки к полям таблицы. Бросает Invalid с текстом для UI."""
-    name = str(data.get("name", "")).strip()
-    if not NAME_RE.match(name):
-        raise Invalid("Имя: от 1 до 64 символов, без «/» и «\\»")
+def clean_url(raw: str) -> str:
+    """Проверяет один адрес и приводит его к каноническому виду.
 
-    url = str(data.get("url", "")).strip()
-    if not url:
-        raise Invalid("Укажите адрес сервиса")
+    Бросает Invalid с текстом для UI: адрес — единственное поле формы, ошибку
+    в котором нельзя заметить постфактум. Опечатка в onion — это не сломанный
+    адрес, а адрес другого сервиса, и найти её потом уже не по чему.
+    """
+    url = raw.strip()
     if "://" not in url:
         url = "http://" + url
     u = urllib.parse.urlsplit(url)
@@ -261,7 +284,7 @@ def clean_target(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
     except ValueError as e:
         raise Invalid(f"Некорректный адрес: {e}") from e
     if not host:
-        raise Invalid("В адресе нет имени хоста")
+        raise Invalid(f"В адресе {raw.strip()!r} нет имени хоста")
     if not host.isascii():
         # Ровно та ошибка, которую даёт адрес-заглушка кириллицей: Tor такой
         # хост не разберёт и ответит общим сбоем SOCKS.
@@ -271,8 +294,60 @@ def clean_target(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
                       "Проверьте адрес — ошибка в одном символе указывает на другой сервис")
     if u.scheme == "tcp" and not port:
         raise Invalid("Для tcp:// нужно указать порт, например tcp://адрес.onion:22")
+    return url
 
-    mode = str(data.get("mode") or ("tcp" if u.scheme == "tcp" else "http"))
+
+def clean_addresses(data: dict[str, Any]) -> list[str]:
+    """Собирает адреса цели: обычный (не больше одного) и onion-зеркала.
+
+    Возвращает их в порядке проверки, первым — главный. Вид адреса определяет
+    имя хоста, а не поле формы: onion, вписанный в строку обычного адреса,
+    останется onion, а не превратится в него по недоразумению.
+    """
+    raw: list[str] = []
+    if data.get("clear"):
+        raw.append(str(data["clear"]))
+    onions = data.get("onions") or []
+    if isinstance(onions, str):
+        onions = re.split(r"[,\s]+", onions)
+    raw += [str(x) for x in onions]
+    # Старая форма записи (и targets[] из конфига): один адрес в поле url.
+    if not any(x.strip() for x in raw) and data.get("url"):
+        raw = [str(data["url"])]
+
+    clear: list[str] = []
+    onion: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not item.strip():
+            continue
+        url = clean_url(item)
+        key = url.lower()
+        if key in seen:
+            raise Invalid(f"Адрес {url} указан дважды")
+        seen.add(key)
+        (onion if Address(url).kind == "onion" else clear).append(url)
+
+    if not clear and not onion:
+        raise Invalid("Укажите хотя бы один адрес сервиса")
+    if len(clear) > 1:
+        raise Invalid("Обычный адрес может быть только один — остальные зеркала должны быть onion")
+    if len(onion) > MAX_ONIONS:
+        raise Invalid(f"Onion-адресов не больше {MAX_ONIONS}, а указано {len(onion)}")
+    return clear + onion
+
+
+def clean_target(data: dict[str, Any], cfg: Config) -> tuple[dict[str, Any], list[str]]:
+    """Приводит форму админки к полям таблицы. Бросает Invalid с текстом для UI."""
+    # Адреса разбираем первыми: имя в форме подставляется из них, и на пустой
+    # форме «укажите адрес» объясняет больше, чем «имя: от 1 до 64 символов».
+    urls = clean_addresses(data)
+    name = str(data.get("name", "")).strip()
+    if not NAME_RE.match(name):
+        raise Invalid("Имя: от 1 до 64 символов, без «/» и «\\»")
+
+    mode = str(data.get("mode")
+               or ("tcp" if urls[0].startswith("tcp://") else "http"))
     if mode not in ("http", "tcp"):
         raise Invalid("Режим: http или tcp")
 
@@ -291,16 +366,6 @@ def clean_target(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
     interval = opt_num("interval", 30, 86400)
     timeout = opt_num("timeout", 5, 600)
 
-    raw_status = data.get("expect_status") or [200]
-    if isinstance(raw_status, str):
-        raw_status = [p for p in re.split(r"[,\s]+", raw_status.strip()) if p]
-    try:
-        expect_status = sorted({int(s) for s in raw_status})
-    except (TypeError, ValueError) as e:
-        raise Invalid("Ожидаемые коды: числа через запятую, например 200, 301") from e
-    if not expect_status or any(not 100 <= s <= 599 for s in expect_status):
-        raise Invalid("Ожидаемые коды должны быть в диапазоне 100–599")
-
     expect_text = (data.get("expect_text") or "").strip() or None
     if expect_text and len(expect_text) > 200:
         raise Invalid("Искомая строка слишком длинная (максимум 200 символов)")
@@ -308,16 +373,15 @@ def clean_target(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
     note = (data.get("note") or "").strip()[:300]
 
     row = {
-        "name": name, "url": url, "mode": mode,
+        "name": name, "url": urls[0], "mode": mode,
         "interval": int(interval) if interval else None,
         "timeout": timeout,
-        "expect_status": json.dumps(expect_status),
         "expect_text": expect_text, "note": note,
         "enabled": 1 if data.get("enabled", True) else 0,
     }
     # Финальная проверка: цель должна собираться.
-    row_to_target(row | {"id": 0}, cfg)
-    return row
+    row_to_target(row | {"id": 0}, cfg, [Address(u) for u in urls])
+    return row, urls
 
 
 def parse_image(data_url: str) -> tuple[bytes, str]:
@@ -352,13 +416,12 @@ def _field(r: Any, key: str, default: Any = None) -> Any:
         return default
 
 
-def row_to_target(r: Any, cfg: Config) -> Target:
+def row_to_target(r: Any, cfg: Config, addresses: list[Address]) -> Target:
     return Target(
         name=r["name"],
-        url=r["url"],
+        addresses=addresses,
         interval=int(r["interval"] or cfg.interval),
         timeout=float(r["timeout"] or cfg.timeout),
-        expect_status=json.loads(r["expect_status"] or "[200]"),
         expect_text=r["expect_text"],
         mode=r["mode"] or "http",
         note=r["note"] or "",
@@ -469,18 +532,13 @@ class Circuits:
         self._creds.pop(name, None)
 
 
-def _header(head: bytes, name: str, lower: bool = True) -> str:
-    """Значение заголовка из уже прочитанного блока.
-
-    По умолчанию приводит к нижнему регистру: так удобно сравнивать имена
-    кодировок. Для Location это недопустимо — путь в URL регистрозависим.
-    """
+def _header(head: bytes, name: str) -> str:
+    """Значение заголовка из уже прочитанного блока, в нижнем регистре."""
     want = name.encode().lower()
     for line in head.split(b"\r\n")[1:]:
         key, sep, value = line.partition(b":")
         if sep and key.strip().lower() == want:
-            got = value.strip().decode("latin-1")
-            return got.lower() if lower else got
+            return value.strip().decode("latin-1").lower()
     return ""
 
 
@@ -524,26 +582,37 @@ class Unpack:
 # Проверка одной цели
 # --------------------------------------------------------------------------
 
-async def check_target(cfg: Config, t: Target, circuits: Circuits | None = None) -> dict[str, Any]:
-    """Возвращает результат проверки: ok, фаза сбоя, коды и тайминги."""
+def circuit_key(t: Target, a: Address) -> str:
+    """Ключ изоляции цепочки: свой у каждого адреса, а не у цели.
+
+    Зеркала — разные сервисы с точки зрения Tor, и общая цепочка означала бы,
+    что упавшее зеркало тянет за собой живое.
+    """
+    return f"ow-{t.name}#{a.id}"
+
+
+async def check_address(cfg: Config, t: Target, a: Address,
+                        circuits: Circuits | None = None) -> dict[str, Any]:
+    """Возвращает результат проверки одного адреса: ok, фаза сбоя, тайминги."""
     res: dict[str, Any] = {
-        "target": t.name, "ts": time.time(), "ok": False, "phase": "circuit",
+        "target": t.name, "addr_id": a.id, "url": a.url,
+        "ts": time.time(), "ok": False, "phase": "circuit",
         "status": None, "connect_ms": None, "ttfb_ms": None, "total_ms": None,
         "error": None, "error_slug": None, "attempts": 1,
     }
     creds: tuple[str | None, str | None] = (None, None)
     if cfg.isolate_circuits:
-        # Отдельная цепочка на каждую цель (Tor IsolateSOCKSAuth): зависший
+        # Отдельная цепочка на каждый адрес (Tor IsolateSOCKSAuth): зависший
         # сервис не тянет за собой остальные. Пароль постоянный в пределах
         # circuit_ttl — иначе каждая проверка строила бы цепочку заново.
-        password = circuits.password(t.name) if circuits else secrets.token_hex(8)
-        creds = (f"ow-{t.name}", password)
+        key = circuit_key(t, a)
+        creds = (key, circuits.password(key) if circuits else secrets.token_hex(8))
 
     t0 = time.perf_counter()
     writer = None
     try:
         reader, writer = await asyncio.wait_for(
-            socks5_open(cfg.tor_socks, t.host, t.port, *creds), timeout=t.timeout
+            socks5_open(cfg.tor_socks, a.host, a.port, *creds), timeout=t.timeout
         )
         res["connect_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         deadline = t0 + t.timeout
@@ -552,15 +621,15 @@ async def check_target(cfg: Config, t: Target, circuits: Circuits | None = None)
             res.update(ok=True, phase="done")
         else:
             res["phase"] = "request"
-            if t.tls:
+            if a.tls:
                 await asyncio.wait_for(
-                    writer.start_tls(_tls_context(), server_hostname=t.host),
+                    writer.start_tls(_tls_context(), server_hostname=a.host),
                     timeout=max(1.0, deadline - time.perf_counter()),
                 )
             # Порт в Host опускаем только если он совпадает со схемой:
             # браузер поступает так же, а строгий вход по имени иначе ответит 404.
-            authority = t.host if t.port == (443 if t.tls else 80) else f"{t.host}:{t.port}"
-            lines = [f"GET {t.path} HTTP/1.1", f"Host: {authority}",
+            authority = a.host if a.port == (443 if a.tls else 80) else f"{a.host}:{a.port}"
+            lines = [f"GET {a.path} HTTP/1.1", f"Host: {authority}",
                      f"User-Agent: {cfg.user_agent}"]
             lines += [f"{k}: {v}" for k, v in BROWSER_HEADERS]
             lines.append("Connection: close")
@@ -578,8 +647,17 @@ async def check_target(cfg: Config, t: Target, circuits: Circuits | None = None)
                 raise ValueError("Сервис ответил не по HTTP")
             res["status"] = int(parts[1])
 
-            ok = res["status"] in t.expect_status
-            if ok and t.expect_text:
+            # Ответил по HTTP — значит, доступен, каким бы код ни был. За
+            # onion-ресурсами почти всегда стоит анти-DDoS: 503 значит
+            # «работает, но придерживает нас», а редирект — что нас встретила
+            # капча. И то и другое в браузере открывается, и разбирать коды
+            # ответа на «те» и «не те» здесь не по чему.
+            ok = True
+            # Единственное содержательное условие, и то по желанию: если задана
+            # строка, её отсутствие в успешном ответе значит, что отвечает не
+            # тот сервис. У кода не 2xx тела с ней и не должно быть — там нас
+            # встретила заглушка, а не сервис, и её отсутствие ни о чём не говорит.
+            if t.expect_text and 200 <= res["status"] < 300:
                 res["phase"] = "body"
                 needle = t.expect_text.encode()
                 unpack = Unpack(_header(head, "Content-Encoding"))
@@ -598,22 +676,8 @@ async def check_target(cfg: Config, t: Target, circuits: Circuits | None = None)
                     ok = False
                     res["error_slug"] = "text_missing"
                     res["error"] = f"В ответе нет строки {t.expect_text!r}"
-            if not ok and not res["error"]:
-                if res["status"] in REDIRECTS:
-                    # Редирект — обычный ответ работающего сервиса: так отвечает
-                    # и капча анти-DDoS, и переехавшая страница. Мы по нему не
-                    # идём, но и недоступностью это не считаем, поэтому пишем,
-                    # куда зовут, а не «ожидался 200».
-                    where = _header(head, "Location", lower=False)
-                    res["error_slug"] = "redirect"
-                    res["error"] = (f"Редирект {res['status']} на {where}" if where
-                                    else f"Редирект {res['status']} без Location")
-                else:
-                    res["error_slug"] = "bad_status"
-                    res["error"] = f"HTTP {res['status']}, ожидался {t.expect_status}"
             res["ok"] = ok
-            # Редирект — не фаза, на которой мы застряли: ответ прочитан целиком.
-            res["phase"] = "done" if ok or res["error_slug"] == "redirect" else res["phase"]
+            res["phase"] = "done" if ok else res["phase"]
 
     except ProxyDown as e:
         res["error_slug"], res["error"] = "tor_down", str(e)
@@ -637,30 +701,22 @@ async def check_target(cfg: Config, t: Target, circuits: Circuits | None = None)
             except Exception:
                 pass
 
-    # Состояние. Если сервис ответил по HTTP — он на связи, каким бы код ни был:
-    # за onion-ресурсами обычно стоит анти-DDoS, и 503 значит «работает, но
-    # придерживает нас», а не «выключен». Красным остаётся только то, до чего мы
-    # не достучались: цепочка, таймаут до ответа, мёртвый tor.
-    #
-    # Редирект — исключение, он идёт в зелёное наравне с совпавшим ответом:
-    # так отвечает капча, и цель за ней доступна ровно в том же смысле, в каком
-    # она открывается в браузере. Куда именно нас увели, видно в подсказке.
-    res["state"] = ("up" if res["ok"] or res["error_slug"] == "redirect"
-                    else "warn" if res["status"] is not None else "down")
+    # Состояний два: до сервиса достучались или нет. Красным остаётся только
+    # то, до чего мы не дошли, — цепочка, таймаут до ответа, мёртвый tor.
+    res["state"] = "up" if res["ok"] else "down"
     res["total_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     return res
 
 
 def retryable(res: dict[str, Any]) -> bool:
     """Стоит ли повторить проверку, или ответ уже окончательный."""
-    if res["error_slug"] in RETRY_SLUGS:
-        return True
-    return res["error_slug"] == "bad_status" and res["status"] in RETRY_STATUS
+    return res["error_slug"] in RETRY_SLUGS
 
 
-async def check_with_retry(cfg: Config, t: Target, circuits: Circuits | None = None,
+async def check_with_retry(cfg: Config, t: Target, a: Address,
+                           circuits: Circuits | None = None,
                            sem: asyncio.Semaphore | None = None) -> dict[str, Any]:
-    """Помечает цель недоступной только после нескольких неудачных попыток.
+    """Помечает адрес недоступным только после нескольких неудачных попыток.
 
     Одна проверка через Tor срывается и на совершенно живом сервисе: цепочка
     не собралась, дескриптор не нашёлся, анти-DDoS придержал под нагрузкой.
@@ -675,17 +731,36 @@ async def check_with_retry(cfg: Config, t: Target, circuits: Circuits | None = N
     res: dict[str, Any] = {}
     for attempt in range(1, total + 1):
         async with guard:
-            res = await check_target(cfg, t, circuits)
+            res = await check_address(cfg, t, a, circuits)
         res["attempts"] = attempt
         if res["ok"]:
             break
         again = retryable(res)
         if again and circuits is not None:
-            circuits.drop(t.name)     # подвела цепочка — следующая попытка берёт новую
+            # Подвела цепочка — следующая попытка берёт новую.
+            circuits.drop(circuit_key(t, a))
         if not again or attempt == total:
             break
         await asyncio.sleep(cfg.retry_delay)
     return res
+
+
+def rollup(t: Target, results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Сводит проверки всех адресов цели в одну запись истории.
+
+    Цель доступна, пока отвечает хоть одно зеркало: адреса на то и заводят,
+    чтобы падение одного не было падением сервиса. Тайминги в ленту берём у
+    первого доступного адреса — а первый в списке всегда главный, так что
+    полоска не прыгает между зеркалами, пока главное работает.
+    """
+    alive = [r for r in results if r["ok"]]
+    row = dict(alive[0] if alive else results[0])
+    row["target"] = t.name
+    row["ok"] = bool(alive)
+    row["state"] = "up" if alive else "down"
+    row["alive"] = len(alive)      # в базу не идёт: нужно логу и --once
+    row["addrs"] = len(results)
+    return row
 
 
 # --------------------------------------------------------------------------
@@ -719,6 +794,9 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_checks_target_ts ON checks(target, ts DESC);
 
+                -- url здесь — главный адрес цели; полный список живёт
+                -- в addresses. Дублируется он ради старых баз и запросов,
+                -- пишется всегда из первого адреса и разъехаться не может.
                 CREATE TABLE IF NOT EXISTS targets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT NOT NULL UNIQUE,
@@ -726,7 +804,6 @@ class Store:
                     mode TEXT NOT NULL DEFAULT 'http',
                     interval INTEGER,
                     timeout REAL,
-                    expect_status TEXT NOT NULL DEFAULT '[200]',
                     expect_text TEXT,
                     note TEXT NOT NULL DEFAULT '',
                     enabled INTEGER NOT NULL DEFAULT 1,
@@ -734,6 +811,28 @@ class Store:
                     updated_at REAL NOT NULL,
                     image BLOB,
                     image_type TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS addresses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_id INTEGER NOT NULL,
+                    url TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_addresses_target
+                    ON addresses(target_id, position);
+
+                -- Только последняя проверка каждого адреса: на карточке нужно
+                -- «доступен или нет», а история и аптайм считаются по цели.
+                CREATE TABLE IF NOT EXISTS addr_last (
+                    addr_id INTEGER PRIMARY KEY,
+                    ts REAL NOT NULL,
+                    state TEXT NOT NULL,
+                    status INTEGER,
+                    connect_ms REAL,
+                    ttfb_ms REAL,
+                    total_ms REAL,
+                    attempts INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS admins (
@@ -767,6 +866,19 @@ class Store:
             if "state" not in have:
                 self.db.execute(
                     "UPDATE checks SET state = CASE WHEN ok THEN 'up' ELSE 'down' END")
+            # Состояний было три, стало два. «С оговоркой» значило «сервис на
+            # связи, но отдал не то» и в аптайм шло как доступность — поэтому
+            # старые записи переезжают в 'up', и цифры от этого не меняются.
+            if self.db.execute("SELECT 1 FROM checks WHERE state='warn' LIMIT 1").fetchone():
+                self.db.execute("UPDATE checks SET state='up' WHERE state='warn'")
+            # База, созданная до появления зеркал, хранит единственный адрес
+            # в самой цели: переносим его в таблицу адресов как главный.
+            for r in self.db.execute(
+                    "SELECT id, url FROM targets"
+                    " WHERE id NOT IN (SELECT target_id FROM addresses)").fetchall():
+                self.db.execute(
+                    "INSERT INTO addresses (target_id, url, position) VALUES (?,?,0)",
+                    (r["id"], r["url"]))
             self.db.commit()
 
     # -- проверки ----------------------------------------------------------
@@ -802,13 +914,11 @@ class Store:
     def summary(self, target: str, window_s: float) -> dict[str, Any]:
         since = time.time() - window_s
         with self.lock:
-            # Аптайм — доля проверок, в которых сервис был на связи, поэтому
-            # ответы «с оговоркой» идут в него наравне с чистыми: они значат
-            # «работает, но отдаёт не то», а не «лежит». Сколько их было,
-            # возвращаем отдельным числом. Тайминги считаем по тем же проверкам:
-            # у ответа с оговоркой время ответа настоящее.
+            # Аптайм — доля проверок, в которых сервис был на связи хотя бы по
+            # одному адресу. Тайминги считаем по тем же проверкам: у недоступной
+            # цели времени ответа нет, и оно только испортило бы среднее.
             row = self.db.execute(
-                "SELECT COUNT(*) n, SUM(state<>'down') alive, SUM(state='warn') warn,"
+                "SELECT COUNT(*) n, SUM(state<>'down') alive,"
                 " AVG(CASE WHEN state<>'down' THEN ttfb_ms END) ttfb,"
                 " AVG(CASE WHEN state<>'down' THEN connect_ms END) conn"
                 " FROM checks WHERE target=? AND ts>=?", (target, since)
@@ -817,7 +927,6 @@ class Store:
         alive = row["alive"] or 0
         return {
             "checks": n,
-            "warn": row["warn"] or 0,
             "uptime": round(100.0 * alive / n, 2) if n else None,
             "avg_ttfb_ms": round(row["ttfb"], 0) if row["ttfb"] else None,
             "avg_circuit_ms": round(row["conn"], 0) if row["conn"] else None,
@@ -832,29 +941,40 @@ class Store:
         q += " ORDER BY id"
         with self.lock:
             rows = self.db.execute(q).fetchall()
+            addr_rows = self.db.execute(
+                "SELECT * FROM addresses ORDER BY target_id, position, id").fetchall()
+        by_target: dict[int, list[Address]] = {}
+        for a in addr_rows:
+            try:
+                by_target.setdefault(a["target_id"], []).append(
+                    Address(url=a["url"], id=a["id"]))
+            except ValueError as e:
+                print(f"! адрес {a['url']!r} пропущен: {e}", file=sys.stderr, flush=True)
         out = []
         for r in rows:
             try:
-                out.append(row_to_target(r, cfg))
+                out.append(row_to_target(r, cfg, by_target.get(r["id"], [])))
             except ValueError as e:
                 print(f"! цель {r['name']!r} пропущена: {e}", file=sys.stderr, flush=True)
         return out
 
-    def add_target(self, row: dict[str, Any]) -> int:
+    def add_target(self, row: dict[str, Any], urls: list[str]) -> int:
         now = time.time()
         with self.lock:
             if self.db.execute("SELECT 1 FROM targets WHERE name=?", (row["name"],)).fetchone():
                 raise Invalid(f"Цель с именем {row['name']!r} уже есть")
             cur = self.db.execute(
-                "INSERT INTO targets (name, url, mode, interval, timeout, expect_status,"
+                "INSERT INTO targets (name, url, mode, interval, timeout,"
                 " expect_text, note, enabled, created_at, updated_at)"
-                " VALUES (:name,:url,:mode,:interval,:timeout,:expect_status,"
+                " VALUES (:name,:url,:mode,:interval,:timeout,"
                 " :expect_text,:note,:enabled,:now,:now)", row | {"now": now})
+            tid = int(cur.lastrowid)
+            self._write_addresses(tid, urls)
             self.db.commit()
             self.targets_rev += 1
-            return int(cur.lastrowid)
+            return tid
 
-    def update_target(self, tid: int, row: dict[str, Any]) -> None:
+    def update_target(self, tid: int, row: dict[str, Any], urls: list[str]) -> None:
         with self.lock:
             old = self.db.execute("SELECT * FROM targets WHERE id=?", (tid,)).fetchone()
             if not old:
@@ -865,9 +985,10 @@ class Store:
                 raise Invalid(f"Цель с именем {row['name']!r} уже есть")
             self.db.execute(
                 "UPDATE targets SET name=:name, url=:url, mode=:mode, interval=:interval,"
-                " timeout=:timeout, expect_status=:expect_status, expect_text=:expect_text,"
+                " timeout=:timeout, expect_text=:expect_text,"
                 " note=:note, enabled=:enabled, updated_at=:now WHERE id=:id",
                 row | {"id": tid, "now": time.time()})
+            self._write_addresses(tid, urls)
             if old["name"] != row["name"]:
                 # История привязана к имени — переносим, иначе графики обнулятся.
                 self.db.execute("UPDATE checks SET target=? WHERE target=?",
@@ -875,16 +996,58 @@ class Store:
             self.db.commit()
             self.targets_rev += 1
 
+    def _write_addresses(self, tid: int, urls: list[str]) -> None:
+        """Приводит список адресов цели к заданному, вызывается под self.lock.
+
+        Уцелевшие адреса сохраняют свой id: к нему привязано их последнее
+        состояние, и пересоздание строк обнуляло бы карточку при каждой правке
+        соседнего поля.
+        """
+        old = {r["url"]: r["id"] for r in self.db.execute(
+            "SELECT id, url FROM addresses WHERE target_id=?", (tid,))}
+        for pos, url in enumerate(urls):
+            aid = old.pop(url, None)
+            if aid is None:
+                self.db.execute(
+                    "INSERT INTO addresses (target_id, url, position) VALUES (?,?,?)",
+                    (tid, url, pos))
+            else:
+                self.db.execute("UPDATE addresses SET position=? WHERE id=?", (pos, aid))
+        for aid in old.values():
+            self.db.execute("DELETE FROM addresses WHERE id=?", (aid,))
+            self.db.execute("DELETE FROM addr_last WHERE addr_id=?", (aid,))
+
     def delete_target(self, tid: int) -> str:
         with self.lock:
             row = self.db.execute("SELECT name FROM targets WHERE id=?", (tid,)).fetchone()
             if not row:
                 raise Invalid("Цель не найдена")
+            self._write_addresses(tid, [])
             self.db.execute("DELETE FROM targets WHERE id=?", (tid,))
             self.db.execute("DELETE FROM checks WHERE target=?", (row["name"],))
             self.db.commit()
             self.targets_rev += 1
             return row["name"]
+
+    # -- состояние адресов -------------------------------------------------
+
+    def set_addr_state(self, res: dict[str, Any]) -> None:
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO addr_last (addr_id, ts, state, status, connect_ms, ttfb_ms,"
+                " total_ms, attempts) VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(addr_id) DO UPDATE SET ts=excluded.ts, state=excluded.state,"
+                " status=excluded.status, connect_ms=excluded.connect_ms,"
+                " ttfb_ms=excluded.ttfb_ms, total_ms=excluded.total_ms,"
+                " attempts=excluded.attempts",
+                (res["addr_id"], res["ts"], res["state"], res["status"], res["connect_ms"],
+                 res["ttfb_ms"], res["total_ms"], res.get("attempts", 1)))
+            self.db.commit()
+
+    def addr_states(self) -> dict[int, dict[str, Any]]:
+        with self.lock:
+            rows = self.db.execute("SELECT * FROM addr_last").fetchall()
+        return {int(r["addr_id"]): dict(r) for r in rows}
 
     def set_image(self, tid: int, blob: bytes, ctype: str) -> None:
         # updated_at двигаем всегда: он попадает в URL картинки как версия,
@@ -922,7 +1085,7 @@ class Store:
         added = 0
         for item in cfg.seed_targets:
             try:
-                self.add_target(clean_target(item, cfg))
+                self.add_target(*clean_target(item, cfg))
                 added += 1
             except Invalid as e:
                 print(f"! цель {item.get('name')!r} из конфига не импортирована: {e}",
@@ -1029,18 +1192,27 @@ class Monitor:
         self._rev = self.store.targets_rev
         fresh = {t.name: t for t in self.store.list_targets(self.cfg, enabled_only=True)}
         now = time.time()
+
+        def addrs(t: Target) -> list[tuple[int, str]]:
+            return [(a.id, a.url) for a in t.addresses]
+
         for name, t in fresh.items():
             old = self.targets.get(name)
-            if old is None or old.url != t.url or old.mode != t.mode:
-                self.due[name] = now      # новая или переписанная цель — проверяем сразу
-                self.circuits.drop(name)  # адрес другой, старая цепочка ни при чём
+            if old is None or addrs(old) != addrs(t) or old.mode != t.mode:
+                # Новая цель или переписанные адреса — проверяем сразу, а старые
+                # цепочки к ней отношения не имеют.
+                self.due[name] = now
+                for a in (old.addresses if old else []) + t.addresses:
+                    self.circuits.drop(circuit_key(t, a))
             elif name not in self.due:
                 self.due[name] = now
         for name in list(self.due):
             if name not in fresh:
                 self.due.pop(name, None)
                 self.last.pop(name, None)
-                self.circuits.drop(name)
+                gone = self.targets.get(name)
+                for a in (gone.addresses if gone else []):
+                    self.circuits.drop(circuit_key(gone, a))
         self.targets = fresh
 
     # -- прогон ------------------------------------------------------------
@@ -1050,19 +1222,27 @@ class Monitor:
             return self.last.get(t.name, {})
         self.running.add(t.name)
         try:
-            res = await check_with_retry(self.cfg, t, self.circuits, self.sem)
+            # Все адреса цели проверяются в одном заходе: карточка показывает их
+            # рядом, и данные в ней должны быть одного времени. Параллельность
+            # ограничивает общий семафор — он берётся внутри, на каждую попытку.
+            results = await asyncio.gather(*(
+                check_with_retry(self.cfg, t, a, self.circuits, self.sem)
+                for a in t.addresses))
         finally:
             self.running.discard(t.name)
-        self.store.add(res)
-        self.last[t.name] = res
-        mark = {"up": "UP  ", "warn": "WARN", "down": "DOWN"}[res["state"]]
-        detail = f"{res['status']}" if res["status"] else (res["error_slug"] or "")
-        tries = res.get("attempts", 1)
+        for res in results:
+            self.store.set_addr_state(res)
+        roll = rollup(t, results)
+        self.store.add(roll)
+        self.last[t.name] = roll
+        mark = "UP  " if roll["state"] == "up" else "DOWN"
+        detail = f"адресов на связи: {roll['alive']} из {roll['addrs']}"
+        tries = roll.get("attempts", 1)
         if tries > 1:
             detail += f" · попыток: {tries}"
         print(f"[{time.strftime('%H:%M:%S')}] {mark} {t.name:<24} "
-              f"{res['total_ms']:>7.0f} ms  {detail}", flush=True)
-        return res
+              f"{roll['total_ms']:>7.0f} ms  {detail}", flush=True)
+        return roll
 
     async def _guarded(self, t: Target) -> None:
         try:
@@ -1116,6 +1296,7 @@ class Monitor:
 
     def state(self) -> dict[str, Any]:
         self.sync_targets()
+        addr_states = self.store.addr_states()
         out = []
         for t in self.targets.values():
             last = self.last.get(t.name)
@@ -1126,9 +1307,17 @@ class Monitor:
                 "id": t.id,
                 "name": t.name,
                 "url": t.url,
-                "host": t.host,
-                "label": t.label,
-                "port": t.port,
+                "host": t.primary.host,
+                "label": t.primary.label,
+                "port": t.primary.port,
+                "addresses": [{
+                    "id": a.id,
+                    "kind": a.kind,
+                    "url": a.url,
+                    "host": a.host,
+                    "label": a.label,
+                    "last": addr_states.get(a.id),
+                } for a in t.addresses],
                 "mode": t.mode,
                 "note": t.note,
                 "has_image": t.has_image,
@@ -1140,9 +1329,10 @@ class Monitor:
                 "week": self.store.summary(t.name, 7 * 86400),
                 "history": self.store.history(t.name, 60),
             })
-        # У записей, сделанных до появления третьего состояния, поля state нет.
+        # У записей, сделанных до появления поля state, его нет.
         marks = [("pending" if not x["last"] else
-                  x["last"].get("state") or ("up" if x["last"].get("ok") else "down"))
+                  "down" if (x["last"].get("state") or ("up" if x["last"].get("ok") else "down"))
+                  == "down" else "up")
                  for x in out]
         return {
             "generated_at": time.time(),
@@ -1150,7 +1340,6 @@ class Monitor:
             "tor_ok": self.tor_alive(),
             "tor_socks": f"{self.cfg.tor_socks[0]}:{self.cfg.tor_socks[1]}",
             "up": marks.count("up"),
-            "warn": marks.count("warn"),
             "down": marks.count("down"),
             "pending": marks.count("pending"),
             "total": len(out),
@@ -1346,13 +1535,16 @@ def make_handler(monitor: Monitor):
                         return None
                     rows = [{
                         "id": t.id, "name": t.name, "url": t.url, "mode": t.mode,
+                        "addresses": [{"id": a.id, "kind": a.kind, "url": a.url}
+                                      for a in t.addresses],
                         "interval": t.interval, "timeout": t.timeout,
-                        "expect_status": t.expect_status, "expect_text": t.expect_text,
+                        "expect_text": t.expect_text,
                         "note": t.note, "enabled": t.enabled, "has_image": t.has_image,
                     } for t in store.list_targets(cfg)]
                     return self._json(200, {"targets": rows,
                                             "defaults": {"interval": cfg.interval,
-                                                         "timeout": cfg.timeout}})
+                                                         "timeout": cfg.timeout},
+                                            "max_onions": MAX_ONIONS})
 
                 return self._json(404, {"error": "Такого маршрута нет"})
             except Invalid as e:
@@ -1384,7 +1576,8 @@ def make_handler(monitor: Monitor):
                     if not self._require_admin():
                         return None
                     data = self._body()
-                    tid = store.add_target(clean_target(data, cfg))
+                    row, urls = clean_target(data, cfg)
+                    tid = store.add_target(row, urls)
                     self._apply_image(tid, data)
                     monitor.sync_targets()
                     return self._json(201, {"id": tid})
@@ -1412,7 +1605,8 @@ def make_handler(monitor: Monitor):
                         return None
                     tid = self._target_id(path)
                     data = self._body()
-                    store.update_target(tid, clean_target(data, cfg))
+                    row, urls = clean_target(data, cfg)
+                    store.update_target(tid, row, urls)
                     self._apply_image(tid, data)
                     monitor.sync_targets()
                     return self._json(200, {"ok": True})
@@ -1500,15 +1694,15 @@ async def run_once(cfg: Config, store: Store) -> int:
         return 2
     results = await asyncio.gather(*(monitor.run_check(t) for t in targets))
     down = [r for r in results if r["state"] == "down"]
-    warn = [r for r in results if r["state"] == "warn"]
+    partial = [r for r in results if r["state"] == "up" and r["alive"] < r["addrs"]]
     print(f"\nДоступно {len(results) - len(down)} из {len(results)}")
-    for r in warn:
-        print(f"  ~ {r['target']}: на связи, но {r['error']}")
+    # В консоли причина сбоя остаётся: она нужна тому, кто пришёл разбираться,
+    # а на дашборде — только «доступен или нет».
+    for r in partial:
+        print(f"  ~ {r['target']}: на связи {r['alive']} из {r['addrs']} адресов")
     for r in down:
-        print(f"  ✗ {r['target']}: {r['error']}")
-    # Код выхода различает «не достучались» и «ответил не тем»: и то и другое
-    # не норма, но реагируют на них по-разному.
-    return 1 if down else (3 if warn else 0)
+        print(f"  ✗ {r['target']}: {r['error'] or 'ни один адрес не ответил'}")
+    return 1 if down else 0
 
 
 def open_store(path: str) -> Store:

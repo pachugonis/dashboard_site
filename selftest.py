@@ -1,7 +1,8 @@
 """Локальная проверка: поддельный SOCKS5-прокси + мини-HTTP-сервер.
 
-Проверяет проверки, публичное API, админку (вход, CRUD целей, защиту
-маршрутов) и валидацию адресов. Сеть Tor и настоящие onion-сервисы не нужны.
+Проверяет проверки, зеркала целей, публичное API, админку (вход, CRUD целей,
+защиту маршрутов) и валидацию адресов. Сеть Tor и настоящие onion-сервисы
+не нужны.
 """
 import asyncio, base64, http.cookiejar, json, os, sqlite3, struct, sys, tempfile, threading, time
 import urllib.error, urllib.request, zlib
@@ -10,6 +11,9 @@ import onionwatch as ow
 
 GOOD = "a" * 56 + ".onion"          # синтетические, но формально корректные v3-адреса
 FAIL = "b" * 56 + ".onion"
+CLEAR = "mirror.example"            # обычный адрес: такое же зеркало, но не onion
+CLEAR_FAIL = "down.example"
+DEAD = frozenset({FAIL, CLEAR_FAIL})
 LOGIN, PASSWORD = "admin", "correct-horse-battery"
 
 fails: list[str] = []
@@ -73,7 +77,7 @@ def make_socks(backend_port):
             ln = (await reader.readexactly(1))[0]
             host = (await reader.readexactly(ln)).decode()
             await reader.readexactly(2)
-            if host == FAIL:
+            if host in DEAD:
                 writer.write(b"\x05\xf0\x00\x01" + b"\x00" * 6)
                 await writer.drain(); writer.close(); return
             writer.write(b"\x05\x00\x00\x01" + b"\x00" * 6)
@@ -179,15 +183,21 @@ async def main() -> int:
     for spec in [
         {"name": "ok", "url": f"http://{GOOD}/", "expect_text": "hello onion", "timeout": 10},
         {"name": "wrong-text", "url": f"http://{GOOD}/", "expect_text": "нет такого", "timeout": 10},
-        {"name": "wrong-status", "url": f"http://{GOOD}/", "expect_status": "404", "timeout": 10},
         {"name": "unreachable", "url": f"http://{FAIL}/", "timeout": 10},
         {"name": "tcp", "url": f"tcp://{GOOD}:1234", "mode": "tcp", "timeout": 10},
         {"name": "gzip", "url": f"http://{GOOD}/gz", "expect_text": "hello onion", "timeout": 10},
         {"name": "captcha", "url": f"http://{GOOD}/captcha", "expect_text": "hello onion",
          "timeout": 10},
         {"name": "busy", "url": f"http://{GOOD}/busy", "timeout": 10},
+        # Зеркала: обычный адрес плюс onion, живые и мёртвые вперемешку.
+        {"name": "зеркала", "clear": f"http://{CLEAR}/",
+         "onions": [f"http://{GOOD}/", f"http://{FAIL}/"], "timeout": 10},
+        {"name": "все-упали", "clear": f"http://{CLEAR_FAIL}/",
+         "onions": [f"http://{FAIL}/"], "timeout": 10},
+        {"name": "живо-зеркало", "clear": f"http://{CLEAR_FAIL}/",
+         "onions": [f"http://{GOOD}/"], "timeout": 10},
     ]:
-        store.add_target(ow.clean_target(spec, cfg))
+        store.add_target(*ow.clean_target(spec, cfg))
 
     mon = ow.Monitor(cfg, store)
     mon.loop = asyncio.get_running_loop()
@@ -196,24 +206,30 @@ async def main() -> int:
     for t in list(mon.targets.values()):
         await mon.run_check(t)
         await mon.run_check(t)
-    for name, want in {"ok": True, "wrong-text": False, "wrong-status": False,
-                       "unreachable": False, "tcp": True, "gzip": True,
-                       "captcha": False, "busy": False}.items():
-        check(f"{name}: ответ совпал с ожиданиями", mon.last[name]["ok"], want)
+    # Доступность — это «до сервиса достучались». Код ответа на неё не влияет:
+    # и 503, и капча-редирект значат «работает, но придерживает».
+    for name, want in {"ok": True, "wrong-text": False, "unreachable": False,
+                       "tcp": True, "gzip": True, "captcha": True, "busy": True,
+                       "зеркала": True, "все-упали": False, "живо-зеркало": True}.items():
+        check(f"{name}: вердикт", mon.last[name]["ok"], want)
     check("причина сбоя разобрана", mon.last["unreachable"]["error_slug"], "descriptor_not_found")
 
     print("\n1a. Попытки, цепочки и заголовки")
     check("сбой цепочки не сразу даёт вердикт",
           mon.last["unreachable"]["attempts"], cfg.attempts)
     check("несовпадение текста повторять незачем", mon.last["wrong-text"]["attempts"], 1)
-    check("чужой код ответа повторять незачем", mon.last["wrong-status"]["attempts"], 1)
     check("успех достаётся с первой попытки", mon.last["ok"]["attempts"], 1)
 
-    alive = [password for user, password in AUTH if user == "ow-ok"]
+    def circuits(prefix):
+        return [password for user, password in AUTH if user.startswith(prefix)]
+
+    alive = circuits("ow-ok#")
     check("живая цель ходит по одной цепочке", (len(alive), len(set(alive))), (2, 1))
-    dead = [password for user, password in AUTH if user == "ow-unreachable"]
+    dead = circuits("ow-unreachable#")
     check("после сбоя цепочка берётся новая",
           (len(dead), len(set(dead))), (2 * cfg.attempts, 2 * cfg.attempts))
+    mirrors = {user for user, _ in AUTH if user.startswith("ow-зеркала#")}
+    check("у каждого зеркала своя цепочка", len(mirrors), 3)
 
     first = SEEN[0].decode("latin-1").lower()
     check("проверка представляется браузером", "firefox/" in first, True)
@@ -221,26 +237,41 @@ async def main() -> int:
     check("шлётся Accept-Encoding", "accept-encoding:" in first, True)
     check("наш служебный User-Agent наружу не уходит", "onionwatch/" in first, False)
 
-    print("\n1б. Три состояния")
+    print("\n1б. Два состояния")
     for name, want in {"ok": "up", "tcp": "up", "gzip": "up", "captcha": "up",
-                       "wrong-text": "warn", "wrong-status": "warn", "busy": "warn",
-                       "unreachable": "down"}.items():
+                       "busy": "up", "зеркала": "up", "живо-зеркало": "up",
+                       "wrong-text": "down", "unreachable": "down",
+                       "все-упали": "down"}.items():
         check(f"{name}: состояние", mon.last[name]["state"], want)
-    # Ответ не тем, чего ждали, — не падение: сервис на связи, и аптайм это видит.
-    check("оговорка не роняет аптайм", store.summary("wrong-text", 3600)["uptime"], 100.0)
-    check("оговорки посчитаны отдельно", store.summary("wrong-text", 3600)["warn"], 2)
     check("недоступность остаётся недоступностью",
           store.summary("unreachable", 3600)["uptime"], 0.0)
 
-    # Капча встречает редиректом — цель за ней доступна так же, как в браузере.
-    check("редирект разобран", mon.last["captcha"]["error_slug"], "redirect")
-    check("в подсказке видно, куда уводит", mon.last["captcha"]["error"],
-          "Редирект 302 на /Check?id=A1b2")
-    check("редирект не считается оговоркой", store.summary("captcha", 3600)["warn"], 0)
-    check("редирект не роняет аптайм", store.summary("captcha", 3600)["uptime"], 100.0)
+    # 503 и капча-редирект — это «работает, но придерживает нас». Причину
+    # такого ответа никуда не пишем: на карточке её всё равно не показать.
+    check("503 — это доступность", mon.last["busy"]["state"], "up")
+    check("503 не роняет аптайм", store.summary("busy", 3600)["uptime"], 100.0)
+    check("у доступного 503 нет описания сбоя", mon.last["busy"]["error"], None)
+    check("капча-редирект — доступность", mon.last["captcha"]["state"], "up")
     check("под редиректом expect_text не проверяется", mon.last["captcha"]["phase"], "done")
-    # 503 — это «работает, но придерживает»: он должен остаться жёлтым.
-    check("503 остаётся оговоркой", mon.last["busy"]["error"], "HTTP 503, ожидался [200]")
+    check("у редиректа тоже нет описания", mon.last["captcha"]["error"], None)
+    # Заданная строка — единственное содержательное условие сверх ответа.
+    check("нет искомой строки — недоступен", mon.last["wrong-text"]["error_slug"], "text_missing")
+
+    print("\n1в. Зеркала")
+    addrs = {a.url: a.id for a in mon.targets["зеркала"].addresses}
+    states = store.addr_states()
+    check("порядок адресов: обычный первым",
+          [a.kind for a in mon.targets["зеркала"].addresses], ["clear", "onion", "onion"])
+    check("живое зеркало доступно", states[addrs[f"http://{CLEAR}/"]]["state"], "up")
+    check("мёртвое зеркало недоступно", states[addrs[f"http://{FAIL}/"]]["state"], "down")
+    check("цель жива, пока отвечает хоть одно зеркало",
+          (mon.last["зеркала"]["alive"], mon.last["зеркала"]["addrs"]), (2, 3))
+    check("аптайм считается по цели, а не по каждому адресу",
+          store.summary("зеркала", 3600)["uptime"], 100.0)
+    # Тайминги в ленту берём у первого доступного адреса, поэтому упавший
+    # главный не оставляет карточку без времени ответа.
+    check("тайминги достались от живого зеркала",
+          mon.last["живо-зеркало"]["url"], f"http://{GOOD}/")
 
     httpd = ow.ThreadingHTTPServer(("127.0.0.1", 0), ow.make_handler(mon))
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -250,9 +281,18 @@ async def main() -> int:
     code, state = api("GET", "/api/state")
     check("/api/state отвечает", code, 200)
     check("сводка по состояниям",
-          (state["up"], state["warn"], state["down"], state["total"]), (4, 3, 1, 8))
+          (state["up"], state["down"], state["total"]), (7, 3, 10))
     check("история пишется", len(state["targets"][0]["history"]), 2)
     check("страница дашборда отдаётся", api("GET", "/")[0], 200)
+
+    mirrors = next(t for t in state["targets"] if t["name"] == "зеркала")
+    check("адреса отдаются наружу", len(mirrors["addresses"]), 3)
+    check("у каждого адреса своё состояние",
+          [a["last"]["state"] for a in mirrors["addresses"]], ["up", "up", "down"])
+    check("вид адреса виден дашборду",
+          [a["kind"] for a in mirrors["addresses"]], ["clear", "onion", "onion"])
+    check("onion-адрес подписан коротко",
+          mirrors["addresses"][1]["label"], "aaaaaaaa…aaaaaaaa.onion")
 
     print("\n3. Админка закрыта до входа")
     check("список целей без сессии", api("GET", "/api/admin/targets")[0], 401)
@@ -274,20 +314,43 @@ async def main() -> int:
 
     print("\n5. Управление целями через админку")
     code, made = api("POST", "/api/admin/targets",
-                     {"name": "новая", "url": f"http://{GOOD}/healthz",
-                      "expect_status": "200, 301", "note": "заведена в админке"})
+                     {"name": "новая", "clear": "https://mirror.test/",
+                      "onions": [f"http://{GOOD}/healthz"], "note": "заведена в админке"})
     check("цель создана", code, 201)
     tid = made.get("id")
     check("демон подхватил её без перезапуска",
           (mon.sync_targets(), "новая" in mon.targets)[1], True)
+    check("оба адреса сохранены",
+          [a.url for a in mon.targets["новая"].addresses],
+          ["https://mirror.test/", f"http://{GOOD}/healthz"])
     check("дубль имени отклонён",
           api("POST", "/api/admin/targets", {"name": "новая", "url": f"http://{GOOD}/"})[0], 400)
+
+    # Идентификатор адреса переживает правку соседних полей: к нему привязано
+    # последнее состояние, и терять его на каждом сохранении нельзя.
+    was = [a.id for a in mon.targets["новая"].addresses]
     check("правка цели", api("PUT", f"/api/admin/targets/{tid}",
-                             {"name": "новая-2", "url": f"http://{GOOD}/", "enabled": False})[0], 200)
+                             {"name": "новая", "clear": "https://mirror.test/",
+                              "onions": [f"http://{GOOD}/healthz"], "note": "правка"})[0], 200)
+    mon.sync_targets()
+    check("уцелевшие адреса сохранили id",
+          [a.id for a in mon.targets["новая"].addresses], was)
+    check("убранный адрес исчез",
+          api("PUT", f"/api/admin/targets/{tid}",
+              {"name": "новая", "onions": [f"http://{GOOD}/healthz"]})[0], 200)
+    mon.sync_targets()
+    check("остался один адрес", len(mon.targets["новая"].addresses), 1)
+    check("состояние убранного адреса удалено", was[0] in store.addr_states(), False)
+
+    check("выключение цели", api("PUT", f"/api/admin/targets/{tid}",
+                                 {"name": "новая-2", "url": f"http://{GOOD}/",
+                                  "enabled": False})[0], 200)
     check("выключенная цель ушла из планировщика",
           (mon.sync_targets(), "новая-2" in mon.targets)[1], False)
     check("удаление цели", api("DELETE", f"/api/admin/targets/{tid}")[0], 200)
-    check("после удаления её нет", len(api("GET", "/api/admin/targets")[1]["targets"]), 8)
+    check("после удаления её нет", len(api("GET", "/api/admin/targets")[1]["targets"]), 10)
+    check("адреса удалённой цели тоже ушли",
+          [aid for aid in was if aid in store.addr_states()], [])
 
     print("\n6. Валидация адресов")
     for label, url in [("кириллица в адресе", "http://ВАШ-АДРЕС-1.onion/"),
@@ -295,6 +358,16 @@ async def main() -> int:
                        ("чужая схема", "ftp://" + GOOD + "/"),
                        ("tcp без порта", "tcp://" + GOOD + "/")]:
         code, resp = api("POST", "/api/admin/targets", {"name": label, "url": url})
+        check(label + " отклонена", code, 400)
+
+    for label, body in [
+        ("цель без единого адреса", {"clear": "", "onions": []}),
+        ("два обычных адреса", {"clear": "https://a.test/", "onions": ["https://b.test/"]}),
+        ("одиннадцать onion-адресов",
+         {"onions": [chr(c) * 56 + ".onion" for c in range(ord("a"), ord("a") + 11)]}),
+        ("повтор адреса", {"onions": [f"http://{GOOD}/", f"http://{GOOD}/"]}),
+    ]:
+        code, resp = api("POST", "/api/admin/targets", {"name": label} | body)
         check(label + " отклонена", code, 400)
 
     print("\n7. Изображения целей")
@@ -388,7 +461,7 @@ async def main() -> int:
     check("выход", api("POST", "/api/logout")[0], 200)
     check("после выхода админка закрыта", api("GET", "/api/admin/targets")[0], 401)
 
-    print("\n10. Миграция базы, созданной до третьего состояния")
+    print("\n10. Миграция старых баз")
     # Без переноса старых записей аптайм за неделю считался бы по половине
     # колонки: у них state пуст, а SUM его пропускает.
     old_path = os.path.join(tmp, "old.db")
@@ -402,11 +475,44 @@ async def main() -> int:
     """)
     old.commit(); old.close()
     migrated = ow.Store(old_path)
-    check("старые записи разнесены по трём состояниям",
+    check("у старых записей появилось состояние",
           [r["state"] for r in migrated.history("старая")], ["up", "down"])
     check("аптайм по старой истории считается", migrated.summary("старая", 10 ** 12)["uptime"], 50.0)
     check("число попыток у старых записей неизвестно",
           migrated.history("старая")[0]["attempts"], None)
+
+    # База времён трёх состояний и единственного адреса у цели. «С оговоркой»
+    # значило «сервис на связи» и в аптайм шло как доступность — значит, и
+    # переезжать оно должно в 'up', не меняя цифр.
+    old_path = os.path.join(tmp, "old3.db")
+    old = sqlite3.connect(old_path)
+    old.executescript(f"""
+        CREATE TABLE checks (id INTEGER PRIMARY KEY AUTOINCREMENT, target TEXT NOT NULL,
+          ts REAL NOT NULL, ok INTEGER NOT NULL, phase TEXT, status INTEGER,
+          connect_ms REAL, ttfb_ms REAL, total_ms REAL, error_slug TEXT, error TEXT,
+          attempts INTEGER, state TEXT);
+        INSERT INTO checks (target, ts, ok, state) VALUES ('старая', 1000000000, 1, 'up'),
+                                                          ('старая', 1000000001, 0, 'warn');
+        CREATE TABLE targets (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+          url TEXT NOT NULL, mode TEXT NOT NULL DEFAULT 'http', interval INTEGER, timeout REAL,
+          expect_status TEXT NOT NULL DEFAULT '[200]', expect_text TEXT,
+          note TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+          created_at REAL NOT NULL, updated_at REAL NOT NULL);
+        INSERT INTO targets (name, url, created_at, updated_at)
+          VALUES ('старая', 'http://{GOOD}/', 0, 0);
+    """)
+    old.commit(); old.close()
+    migrated = ow.Store(old_path)
+    check("оговорка переехала в доступность",
+          [r["state"] for r in migrated.history("старая")], ["up", "up"])
+    check("аптайм от переезда не изменился",
+          migrated.summary("старая", 10 ** 12)["uptime"], 100.0)
+    single = migrated.list_targets(cfg)
+    check("единственный адрес цели переехал в таблицу адресов",
+          [a.url for a in single[0].addresses], [f"http://{GOOD}/"])
+    check("повторное открытие базы адрес не задваивает",
+          [a.url for a in ow.Store(old_path).list_targets(cfg)[0].addresses],
+          [f"http://{GOOD}/"])
 
     httpd.shutdown()
     print("\nПровалов:", len(fails) or "нет", *(f"\n  - {f}" for f in fails))
