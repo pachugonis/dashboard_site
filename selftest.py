@@ -472,12 +472,24 @@ async def main() -> int:
     csp = api.raw("/admin")[1].get("Content-Security-Policy", "")
     check("CSP разрешает картинки из data:", "data:" in csp, True)
     here = os.path.dirname(os.path.abspath(__file__))
+    pages = {}
     for page in ("admin.html", "dashboard.html"):
         text = open(os.path.join(here, page), encoding="utf-8").read()
-        code = "\n".join(line for line in text.splitlines()
-                         if not line.lstrip().startswith("//"))   # без комментариев
+        pages[page] = "\n".join(line for line in text.splitlines()
+                                if not line.lstrip().startswith("//"))   # без комментариев
         check(f"{page}: не грузит картинки по схеме, запрещённой CSP",
-              "createObjectURL" not in code or "blob:" in csp, True)
+              "createObjectURL" not in pages[page] or "blob:" in csp, True)
+
+    # Tor Browser отдаёт из canvas шум вместо нарисованного, и подмену видно
+    # только глазами на карточке. Админка обязана проверять это перед обрезкой
+    # и иметь запасной путь — иначе на сервер снова уедет рябь.
+    admin_code = pages["admin.html"]
+    check("админка проверяет, честно ли читается canvas",
+          "canvasReadable()" in admin_code and "getImageData" in admin_code, True)
+    check("у обрезки есть запасной путь без canvas",
+          "passThroughRaster" in admin_code, True)
+    check("карточка вписывает картинку целиком, а не режет",
+          "object-fit: contain" in pages["dashboard.html"], True)
 
     print("\n9. Смена пароля и выход")
     check("смена с неверным текущим",

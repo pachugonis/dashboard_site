@@ -207,7 +207,8 @@
                 не растягиваем. «Вписать» сохраняет логотип целиком и нужен для
                 широких картинок; «обрезать» вырезает центр и подходит
                 фотографиям. SVG уходит как есть — вектор режут не пиксели,
-                а вёрстка.</div>
+                а вёрстка. В Tor Browser как есть уходит и растр: он не даёт
+                читать canvas, и выбор способа там выключен.</div>
             </div>
           </div>
         </div>
@@ -309,12 +310,56 @@ function isSvg(file) {
   return file.type === "image/svg+xml" || /\.svg$/i.test(file.name || "");
 }
 
+// Tor Browser — а он тут основной браузер — считает чтение canvas попыткой
+// снять отпечаток и отдаёт из toDataURL/getImageData не нарисованное, а шум
+// (в старых сборках — чистый лист). Нарисовать он даёт, прочитать — нет, так
+// что молча получалась мелкая рябь вместо логотипа, и она же уезжала на сервер.
+// Спрашиваем честно: заливаем известный цвет и проверяем, он ли прочитался.
+let canvasHonest = null;
+function canvasReadable() {
+  if (canvasHonest !== null) return canvasHonest;
+  canvasHonest = false;
+  try {
+    const probe = document.createElement("canvas");
+    probe.width = probe.height = 64;      // мелкая проба может и не попасть под шум
+    const ctx = probe.getContext("2d");
+    ctx.fillStyle = "rgb(62, 207, 160)";
+    ctx.fillRect(0, 0, 64, 64);
+    const data = ctx.getImageData(0, 0, 64, 64).data;
+    canvasHonest = true;
+    for (let i = 0; i < data.length; i += 4) {
+      if (data[i] !== 62 || data[i + 1] !== 207 || data[i + 2] !== 160 || data[i + 3] !== 255) {
+        canvasHonest = false;
+        break;
+      }
+    }
+  } catch (e) {
+    canvasHonest = false;                 // getImageData может и просто броситься
+  }
+  return canvasHonest;
+}
+
+// Раз читать canvas нельзя, растр отправляем как есть: лучше картинка в своём
+// размере, чем шум вместо неё. Квадрат для неё делает вёрстка — как для SVG.
+async function passThroughRaster(file) {
+  const url = await readDataUrl(file);
+  if (!/^data:image\/(png|jpeg);base64,/.test(url)) {
+    throw new Error("Файл не читается как PNG или JPEG");
+  }
+  if (url.length > IMG_MAX_CHARS) {
+    throw new Error("Этот браузер запрещает читать canvas, поэтому уменьшить "
+                  + "картинку не выйдет — выберите файл до 1 МБ");
+  }
+  await loadImage(url);
+  return url;
+}
+
 async function prepareImage(file, mode) {
   if (isSvg(file)) return passThroughSvg(file);
   if (file.type !== "image/png" && file.type !== "image/jpeg") {
     throw new Error("Годятся только PNG, JPEG и SVG");
   }
-  return squareCrop(file, mode);
+  return canvasReadable() ? squareCrop(file, mode) : passThroughRaster(file);
 }
 
 // Обрезка в квадрат по центру и уменьшение делаются здесь: у демона нет
@@ -323,20 +368,41 @@ async function prepareImage(file, mode) {
 // поля прозрачным, — для широкого логотипа только так он и останется виден.
 // «crop» вырезает центр: годится для фотографий, но у баннера съедает всё,
 // кроме узкой полоски посередине.
+// Уменьшать больше чем вдвое за один drawImage нельзя: браузер берёт для
+// каждой точки крошечную окрестность исходника, и мелкая деталь — штриховка,
+// сетка, буквы — не усредняется, а превращается в муар: вместо логотипа
+// получаются полосы. Ужимаем вдвое за шаг, пока до нужного размера не останется
+// меньше двойки; последний шаг делает уже сам toSquare.
+function halved(img, w, h, dw, dh) {
+  let src = img, sw = w, sh = h;
+  while (sw >= dw * 2 && sh >= dh * 2 && sw > 1 && sh > 1) {
+    const step = document.createElement("canvas");
+    step.width = sw = Math.max(1, Math.round(sw / 2));
+    step.height = sh = Math.max(1, Math.round(sh / 2));
+    const ctx = step.getContext("2d");
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(src, 0, 0, step.width, step.height);
+    src = step;
+  }
+  return { src, kx: sw / w, ky: sh / h };
+}
+
 function toSquare(img, size, mode) {
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d");
   ctx.imageSmoothingQuality = "high";
   const w = img.naturalWidth, h = img.naturalHeight;
-  if (mode === "crop") {
-    const side = Math.min(w, h);
-    ctx.drawImage(img, (w - side) / 2, (h - side) / 2, side, side, 0, 0, size, size);
-  } else {
-    const scale = Math.min(size / w, size / h);
-    const dw = Math.round(w * scale), dh = Math.round(h * scale);
-    ctx.drawImage(img, 0, 0, w, h, (size - dw) / 2, (size - dh) / 2, dw, dh);
-  }
+  // Что берём из исходника: «crop» — центральный квадрат, «fit» — всю картинку.
+  const side = Math.min(w, h);
+  const cut = mode === "crop"
+    ? { x: (w - side) / 2, y: (h - side) / 2, w: side, h: side }
+    : { x: 0, y: 0, w, h };
+  const scale = Math.min(size / cut.w, size / cut.h);
+  const dw = Math.round(cut.w * scale), dh = Math.round(cut.h * scale);
+  const { src, kx, ky } = halved(img, w, h, dw, dh);
+  ctx.drawImage(src, cut.x * kx, cut.y * ky, cut.w * kx, cut.h * ky,
+                (size - dw) / 2, (size - dh) / 2, dw, dh);
   return canvas;
 }
 
@@ -571,6 +637,7 @@ function fillForm(t) {
   pendingFile = null;
   clearImage = false;
   el("f-file").value = "";
+  el("f-fit").disabled = false;
   // Свежий URL при каждом показе: иначе после замены увидим старую из кэша.
   showThumb(t && t.has_image ? `/api/targets/${t.id}/image?v=${Date.now()}` : null);
   el("form-title").textContent = t ? `Цель «${t.name}»` : "Новая цель";
@@ -603,10 +670,18 @@ function formData() {
 async function applyPickedFile() {
   if (!pendingFile) return;
   say("f-msg", "", "");
+  // Способ обрезки живёт только в canvas: у вектора и у браузера, который
+  // canvas читать не даёт, выбор ни на что не влияет — не притворяемся.
+  const byCanvas = !isSvg(pendingFile) && canvasReadable();
+  el("f-fit").disabled = !byCanvas;
   try {
     pendingImage = await prepareImage(pendingFile, el("f-fit").value);
     clearImage = false;
     showThumb(pendingImage);
+    if (!byCanvas && !isSvg(pendingFile)) {
+      say("f-msg", "Браузер запрещает читать canvas — картинка уходит как есть, "
+                 + "без обрезки в квадрат. Вписать её в карточку сумеет вёрстка.", "ok");
+    }
   } catch (e) {
     pendingImage = null;
     showThumb(null);
@@ -625,7 +700,9 @@ el("f-img-clear").addEventListener("click", () => {
   pendingFile = null;
   clearImage = true;
   el("f-file").value = "";
+  el("f-fit").disabled = false;
   showThumb(null);
+  say("f-msg", "", "");
 });
 
 el("f-save").addEventListener("click", async () => {
