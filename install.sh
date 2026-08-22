@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Установка onionwatch на Ubuntu 24.04. Запускать от root из каталога,
-# где лежат onionwatch.py, dashboard.html, onionwatch.service, config.example.json.
+# где лежат onionwatch.py, dashboard.html, news.html, onionwatch.service, config.example.json.
 #
 #   sudo ./install.sh                 # tor из репозитория Tor Project
 #   sudo ./install.sh --universe      # tor из штатного репозитория Ubuntu
@@ -22,7 +22,7 @@ die() { printf '\033[1;31mОшибка:\033[0m %s\n' "$1" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || die "нужны права root: sudo ./install.sh"
 if [[ ${1:-} == "--universe" ]]; then TOR_SOURCE=universe; fi
 
-for f in onionwatch.py dashboard.html admin.html onionwatch.service config.example.json; do
+for f in onionwatch.py dashboard.html admin.html news.html onionwatch.service config.example.json; do
   [[ -f "${SRC_DIR}/${f}" ]] || die "рядом со скриптом нет файла ${f}"
 done
 
@@ -75,6 +75,7 @@ say "Копирую файлы приложения"
 install -o root -g root -m 0644 "${SRC_DIR}/onionwatch.py"  "${APP_DIR}/onionwatch.py"
 install -o root -g root -m 0644 "${SRC_DIR}/dashboard.html" "${APP_DIR}/dashboard.html"
 install -o root -g root -m 0644 "${SRC_DIR}/admin.html"     "${APP_DIR}/admin.html"
+install -o root -g root -m 0644 "${SRC_DIR}/news.html"      "${APP_DIR}/news.html"
 if [[ -f "${SRC_DIR}/README.md" ]]; then
   install -m 0644 "${SRC_DIR}/README.md" "${APP_DIR}/README.md"
 fi

@@ -30,17 +30,28 @@
     justify-content: space-between; border-bottom: 1px solid var(--line); padding-bottom: 18px; }
   .meta { font-family: var(--mono); font-size: 12px; color: var(--muted);
     display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  .top-right { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
   a { color: var(--circuit); }
+
+  /* Верхнее меню: одинаковое на всех страницах. */
+  nav.nav { display: flex; gap: 6px; flex-wrap: wrap; }
+  nav.nav a { font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+    text-decoration: none; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; }
+  nav.nav a:hover { background: var(--panel-2); border-color: #3a4270; color: var(--text); }
+  nav.nav a[aria-current="page"] { color: #fff; border-color: var(--circuit);
+    background: linear-gradient(var(--panel-2), var(--panel)); }
 
   .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
     padding: 20px; margin-top: 18px; }
   label { display: block; font-family: var(--mono); font-size: 10px; letter-spacing: .12em;
     text-transform: uppercase; color: var(--dim); margin-bottom: 5px; }
-  input, select, .btn, button {
+  input, select, textarea, .btn, button {
     font: inherit; font-size: 14px; color: var(--text); background: var(--panel-2);
     border: 1px solid var(--line); border-radius: 8px; padding: 8px 11px; width: 100%;
   }
-  input::placeholder { color: var(--dim); }
+  textarea { font-family: var(--sans); line-height: 1.5; resize: vertical; min-height: 120px; }
+  input::placeholder, textarea::placeholder { color: var(--dim); }
   .btn, button { cursor: pointer; width: auto; text-decoration: none; display: inline-block; }
   .btn:hover, button:hover { border-color: #3a4270; }
   button.primary { background: var(--circuit); border-color: var(--circuit); color: #12132a;
@@ -97,6 +108,12 @@
   .t-thumb { width: 34px; height: 34px; border-radius: 8px; flex: none;
     background: var(--panel-2) center/contain no-repeat; border: 1px solid var(--line); }
   .t-head { display: flex; gap: 10px; align-items: center; }
+  /* У новости картинка широкая, и превью в списке шире квадратного. */
+  .n-thumb { width: 84px; height: 56px; border-radius: 8px; flex: none;
+    background: var(--panel-2) center/contain no-repeat; border: 1px solid var(--line); }
+  .n-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .n-when { font-family: var(--mono); font-size: 11px; color: var(--dim);
+    margin-bottom: 4px; }
 
   .msg { border-radius: 8px; padding: 10px 14px; margin-top: 14px; font-size: 14px; }
   .msg.err { border: 1px solid var(--down); background: rgba(255,93,115,.09); }
@@ -114,7 +131,14 @@
       <div class="eyebrow">Управление целями</div>
       <h1>onion<span>watch</span> — админка</h1>
     </div>
-    <div class="meta" id="meta"></div>
+    <div class="top-right">
+      <nav class="nav" aria-label="Разделы">
+        <a href="/">Дашборд</a>
+        <a href="/news">Новости</a>
+        <a href="/admin" aria-current="page">Админка</a>
+      </nav>
+      <div class="meta" id="meta"></div>
+    </div>
   </header>
 
   <!-- Вход -->
@@ -230,6 +254,42 @@
     </div>
 
     <div class="panel">
+      <h2 id="news-form-title">Новая новость</h2>
+      <div class="fields">
+        <div class="wide">
+          <label>Изображение</label>
+          <div class="img-row">
+            <div class="thumb" id="n-thumb" aria-hidden="true"></div>
+            <div class="img-ctl">
+              <input type="file" id="n-file" accept="image/png,image/jpeg,image/svg+xml,.svg">
+              <button type="button" id="n-img-clear" class="hidden">Убрать изображение</button>
+              <div class="hint">Годятся PNG, JPEG и SVG до 1 МБ. Картинку новости
+                не режут в квадрат — она уходит целиком, только уменьшается до
+                1024 пикселей по большей стороне. Необязательна: без неё новость
+                останется одним текстом.</div>
+            </div>
+          </div>
+        </div>
+        <div class="wide">
+          <label for="n-text">Текст</label>
+          <textarea id="n-text" rows="6" placeholder="что произошло"></textarea>
+          <div class="hint">До 4000 символов, без разметки. Пустая строка делит
+            текст на абзацы, одиночный перенос так и остаётся переносом.</div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="primary" id="n-save">Опубликовать</button>
+        <button id="n-cancel" class="hidden">Отмена</button>
+      </div>
+      <div id="n-msg"></div>
+    </div>
+
+    <div class="panel">
+      <h2>Новости</h2>
+      <div id="news"></div>
+    </div>
+
+    <div class="panel">
       <h2>Смена пароля</h2>
       <div class="fields">
         <div>
@@ -258,6 +318,8 @@ const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;
 let editing = null, defaults = { interval: 300, timeout: 60 }, maxOnions = 10;
 // Картинка, выбранная в форме, но ещё не сохранённая, и флаг «удалить имеющуюся».
 let pendingImage = null, clearImage = false, pendingFile = null;
+// То же самое для формы новости: у неё своя картинка и своя правка.
+let editingNews = null, newsImage = null, newsClearImage = false;
 
 // «1 адрес», «2 адреса», «5 адресов» — форма зависит от последних цифр.
 function plural(n, one, few, many) {
@@ -423,6 +485,18 @@ function hasAlpha(canvas) {
   return false;
 }
 
+// Картинку с прозрачностью в JPEG переводить нельзя: он прозрачность не
+// умеет, под неё пришлось бы подложить фон — и светлый логотип, нарисованный
+// по прозрачному, слился бы с ним начисто. Такие остаются PNG.
+// Непрозрачное: плоский логотип в PNG весит единицы килобайт, фотография —
+// сотни. Страницы ходят через Tor, где каждый килобайт заметен, поэтому
+// тяжёлое пережимаем в JPEG. Терять там нечего — прозрачности нет.
+function encodeCanvas(canvas) {
+  const png = canvas.toDataURL("image/png");
+  if (hasAlpha(canvas) || png.length <= 60000) return png;
+  return canvas.toDataURL("image/jpeg", 0.85);
+}
+
 async function squareCrop(file, mode) {
   const img = await loadImage(await readDataUrl(file));
   if (!Math.min(img.naturalWidth, img.naturalHeight)) {
@@ -430,37 +504,62 @@ async function squareCrop(file, mode) {
   }
   const side = squareSide(img, mode);
   const canvas = toSquare(img, side, mode);
-
-  // Картинку с прозрачностью в JPEG переводить нельзя: он прозрачность не
-  // умеет, под неё пришлось бы подложить фон — и светлый логотип, нарисованный
-  // по прозрачному, слился бы с ним начисто. Такие остаются PNG, а если не
-  // влезают в лимит, уменьшаем сторону, но формат не меняем.
-  if (hasAlpha(canvas)) {
-    for (const size of [side, 192, 160, 128].filter(v => v <= side)) {
-      const out = (size === side ? canvas : toSquare(img, size, mode))
-        .toDataURL("image/png");
-      if (out.length <= IMG_MAX_CHARS) return out;
-    }
-    throw new Error("Прозрачное изображение слишком тяжёлое — уменьшите его заранее");
+  // Не влезли в лимит — уменьшаем сторону и пробуем снова: формат при этом
+  // выбирается заново, прозрачное так и остаётся PNG.
+  for (const size of [side, 192, 160, 128].filter(v => v <= side)) {
+    const out = encodeCanvas(size === side ? canvas : toSquare(img, size, mode));
+    if (out.length <= IMG_MAX_CHARS) return out;
   }
-
-  // Непрозрачное: плоский логотип в PNG весит единицы килобайт, фотография —
-  // сотни. Дашборд ходит через Tor, где каждый килобайт заметен, поэтому
-  // тяжёлое пережимаем в JPEG. Терять здесь нечего — прозрачности нет.
-  let out = canvas.toDataURL("image/png");
-  if (out.length > 60000) {
-    out = canvas.toDataURL("image/jpeg", 0.85);
-  }
-  if (out.length > IMG_MAX_CHARS) throw new Error("Изображение слишком тяжёлое");
-  return out;
+  throw new Error("Изображение слишком тяжёлое — уменьшите его заранее");
 }
 
-function showThumb(src) {
-  const box = el("f-thumb");
-  box.style.backgroundImage = src ? `url("${src}")` : "";
-  box.classList.toggle("set", !!src);
-  box.textContent = src ? "" : "нет";
-  el("f-img-clear").classList.toggle("hidden", !src);
+// -- картинка новости ------------------------------------------------------
+
+const NEWS_SIZE = 1024;   // потолок по большей стороне; квадрат новости не нужен
+
+// Картинка новости — часть сообщения, а не значок: обрезать её нечем и незачем,
+// поэтому пропорции сохраняем, а уменьшаем по большей стороне.
+function toBox(img, maxSide) {
+  const w = img.naturalWidth, h = img.naturalHeight;
+  const scale = Math.min(1, maxSide / Math.max(w, h));
+  const dw = Math.max(1, Math.round(w * scale)), dh = Math.max(1, Math.round(h * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = dw;
+  canvas.height = dh;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  // Тот же приём, что и у квадрата: больше чем вдвое за раз не ужимаем,
+  // иначе мелкая деталь превращается не в мелкую деталь, а в муар.
+  const { src, kx, ky } = halved(img, w, h, dw, dh);
+  ctx.drawImage(src, 0, 0, w * kx, h * ky, 0, 0, dw, dh);
+  return canvas;
+}
+
+async function prepareNewsImage(file) {
+  if (isSvg(file)) return passThroughSvg(file);
+  if (file.type !== "image/png" && file.type !== "image/jpeg") {
+    throw new Error("Годятся только PNG, JPEG и SVG");
+  }
+  if (!canvasReadable()) return passThroughRaster(file);
+  const img = await loadImage(await readDataUrl(file));
+  if (!Math.min(img.naturalWidth, img.naturalHeight)) {
+    throw new Error("Не удалось определить размер изображения");
+  }
+  for (const side of [NEWS_SIZE, 768, 512, 320]) {
+    const out = encodeCanvas(toBox(img, side));
+    if (out.length <= IMG_MAX_CHARS) return out;
+  }
+  throw new Error("Изображение слишком тяжёлое — уменьшите его заранее");
+}
+
+// Превью выбранной картинки: у формы цели и у формы новости оно одинаковое,
+// различаются только узлы.
+function showThumb(src, box = "f-thumb", drop = "f-img-clear") {
+  const node = el(box);
+  node.style.backgroundImage = src ? `url("${src}")` : "";
+  node.classList.toggle("set", !!src);
+  node.textContent = src ? "" : "нет";
+  el(drop).classList.toggle("hidden", !src);
 }
 
 function say(node, text, kind) {
@@ -491,8 +590,8 @@ async function boot() {
   const s = await (await fetch("/api/session", { cache: "no-store" })).json();
   el("meta").innerHTML = s.authed
     ? `<span>вход выполнен: <b>${esc(s.login)}</b></span>`
-      + `<a href="/">← дашборд</a> <button id="logout">Выйти</button>`
-    : `<a href="/">← дашборд</a>`;
+      + `<button id="logout">Выйти</button>`
+    : "";
   if (s.authed) el("logout").addEventListener("click", async () => {
     await api("POST", "/api/logout"); location.reload();
   });
@@ -500,7 +599,13 @@ async function boot() {
     : "Администратор ещё не создан. Выполните на сервере: "
       + "python3 onionwatch.py --config <конфиг> --set-admin admin";
   show(s.authed);
-  if (s.authed) { showThumb(null); setOnions([]); loadTargets(); }
+  if (s.authed) {
+    showThumb(null);
+    setOnions([]);
+    loadTargets();
+    fillNewsForm(null);
+    loadNews();
+  }
 }
 
 // -- вход ------------------------------------------------------------------
@@ -707,11 +812,14 @@ el("f-img-clear").addEventListener("click", () => {
 
 el("f-save").addEventListener("click", async () => {
   el("f-save").disabled = true;
+  // Что делали, помним заранее: fillForm(null) сбрасывает editing, и сообщение
+  // об исходе иначе всегда получалось бы «цель добавлена».
+  const was = editing;
   try {
-    if (editing) await api("PUT", "/api/admin/targets/" + editing, formData());
+    if (was) await api("PUT", "/api/admin/targets/" + was, formData());
     else await api("POST", "/api/admin/targets", formData());
     fillForm(null);
-    say("f-msg", editing ? "Сохранено." : "Цель добавлена — первая проверка уже в очереди.", "ok");
+    say("f-msg", was ? "Сохранено." : "Цель добавлена — первая проверка уже в очереди.", "ok");
     loadTargets();
   } catch (e) {
     say("f-msg", e.message, "err");
@@ -737,6 +845,133 @@ el("targets").addEventListener("click", async ev => {
     loadTargets();
   } catch (e) {
     say("f-msg", e.message, "err");
+  }
+});
+
+// -- новости ---------------------------------------------------------------
+
+const newsWhen = ts => new Date(ts * 1000).toLocaleString("ru-RU",
+  { day: "numeric", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit" });
+
+// В списке новость только опознают, читают её на странице новостей.
+const excerpt = text => text.length > 200 ? text.slice(0, 200).trimEnd() + "…" : text;
+
+function newsRow(n) {
+  return `<tr>
+    <td>
+      <div class="t-head">
+        ${n.has_image
+          ? `<div class="n-thumb" style="background-image:url('/api/news/${n.id}/image?v=${n.image_v}')"></div>`
+          : ""}
+        <div style="min-width:0">
+          <div class="n-when">${esc(newsWhen(n.created_at))}</div>
+          <div class="n-text">${esc(excerpt(n.text))}</div>
+        </div>
+      </div>
+    </td>
+    <td class="act">
+      <button data-news-edit="${n.id}">Изменить</button>
+      <button class="danger" data-news-del="${n.id}">Удалить</button>
+    </td>
+  </tr>`;
+}
+
+async function loadNews() {
+  try {
+    // Лента у админки и у страницы новостей одна и та же: отдельного
+    // админского списка нет, показывать в нём было бы нечего сверх этого.
+    const data = await api("GET", "/api/news");
+    window.__news = data.news;
+    el("news").innerHTML = data.news.length
+      ? `<table><thead><tr><th>Новость</th><th></th></tr></thead>
+         <tbody>${data.news.map(newsRow).join("")}</tbody></table>`
+      : `<div class="hint">Новостей пока нет. Опубликуйте первую в форме выше —
+         она сразу появится на <a href="/news">странице новостей</a>.</div>`;
+  } catch (e) {
+    if (/401|вход/i.test(e.message)) return show(false);
+    el("news").innerHTML = `<div class="msg err">${esc(e.message)}</div>`;
+  }
+}
+
+function fillNewsForm(n) {
+  editingNews = n ? n.id : null;
+  el("n-text").value = n ? n.text : "";
+  newsImage = null;
+  newsClearImage = false;
+  el("n-file").value = "";
+  // Свежий URL при каждом показе: иначе после замены увидим старую из кэша.
+  showThumb(n && n.has_image ? `/api/news/${n.id}/image?v=${Date.now()}` : null,
+            "n-thumb", "n-img-clear");
+  el("news-form-title").textContent = n ? "Правка новости" : "Новая новость";
+  el("n-save").textContent = n ? "Сохранить" : "Опубликовать";
+  el("n-cancel").classList.toggle("hidden", !n);
+  say("n-msg", "", "");
+  if (n) el("n-text").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+el("n-file").addEventListener("change", async ev => {
+  const file = (ev.target.files && ev.target.files[0]) || null;
+  say("n-msg", "", "");
+  if (!file) return;
+  try {
+    newsImage = await prepareNewsImage(file);
+    newsClearImage = false;
+    showThumb(newsImage, "n-thumb", "n-img-clear");
+    if (!isSvg(file) && !canvasReadable()) {
+      say("n-msg", "Браузер запрещает читать canvas — картинка уходит как есть, "
+                 + "без уменьшения. Вписать её в ленту сумеет вёрстка.", "ok");
+    }
+  } catch (e) {
+    newsImage = null;
+    showThumb(null, "n-thumb", "n-img-clear");
+    say("n-msg", e.message, "err");
+  }
+});
+
+el("n-img-clear").addEventListener("click", () => {
+  newsImage = null;
+  newsClearImage = true;
+  el("n-file").value = "";
+  showThumb(null, "n-thumb", "n-img-clear");
+  say("n-msg", "", "");
+});
+
+el("n-save").addEventListener("click", async () => {
+  el("n-save").disabled = true;
+  const was = editingNews;
+  try {
+    const body = { text: el("n-text").value, image: newsImage,
+                   image_clear: newsClearImage };
+    if (was) await api("PUT", "/api/admin/news/" + was, body);
+    else await api("POST", "/api/admin/news", body);
+    fillNewsForm(null);
+    say("n-msg", was ? "Сохранено."
+                     : "Новость опубликована — она уже на странице новостей.", "ok");
+    loadNews();
+  } catch (e) {
+    say("n-msg", e.message, "err");
+  } finally {
+    el("n-save").disabled = false;
+  }
+});
+el("n-cancel").addEventListener("click", () => fillNewsForm(null));
+
+el("news").addEventListener("click", async ev => {
+  const edit = ev.target.closest("[data-news-edit]");
+  if (edit) {
+    const n = (window.__news || []).find(x => x.id === Number(edit.dataset.newsEdit));
+    if (n) fillNewsForm(n);
+    return;
+  }
+  const del = ev.target.closest("[data-news-del]");
+  if (!del) return;
+  if (!confirm("Удалить эту новость? Вернуть её будет нельзя.")) return;
+  try {
+    await api("DELETE", "/api/admin/news/" + del.dataset.newsDel);
+    if (editingNews === Number(del.dataset.newsDel)) fillNewsForm(null);
+    loadNews();
+  } catch (e) {
+    say("n-msg", e.message, "err");
   }
 });
 

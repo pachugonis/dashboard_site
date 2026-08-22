@@ -291,6 +291,8 @@ async def main() -> int:
     print("\n3. Админка закрыта до входа")
     check("список целей без сессии", api("GET", "/api/admin/targets")[0], 401)
     check("создание цели без сессии", api("POST", "/api/admin/targets", {"url": "x"})[0], 401)
+    check("публикация новости без сессии",
+          api("POST", "/api/admin/news", {"text": "тайком"})[0], 401)
     check("админа ещё нет", api("GET", "/api/session")[1]["has_admin"], False)
 
     print("\n4. Вход по логину и паролю")
@@ -465,7 +467,77 @@ async def main() -> int:
           any(t["id"] == img_id for t in api("GET", "/api/admin/targets")[1]["targets"]), True)
     api("DELETE", f"/api/admin/targets/{img_id}")
 
-    print("\n8. Страницы и заголовок CSP")
+    print("\n8. Новости")
+    check("лента пуста, пока ничего не опубликовано", api("GET", "/api/news")[1]["news"], [])
+    code, first = api("POST", "/api/admin/news",
+                      {"text": "Первая новость\n\nи второй абзац к ней",
+                       "image": data_url(png)})
+    check("новость опубликована", code, 201)
+    news_id = first.get("id")
+    feed = api("GET", "/api/news")[1]["news"]
+    check("новость видна в ленте", len(feed), 1)
+    check("текст сохранён целиком", feed[0]["text"], "Первая новость\n\nи второй абзац к ней")
+    check("признак картинки в ленте", feed[0]["has_image"], True)
+    status, headers, body = api.raw(f"/api/news/{news_id}/image")
+    check("картинка новости отдаётся", status, 200)
+    check("тип содержимого картинки новости", headers.get("Content-Type"), "image/png")
+    check("байты картинки новости совпадают", body == png, True)
+    check("картинка новости кэшируется",
+          "max-age" in (headers.get("Cache-Control") or ""), True)
+    check("повторный запрос с ETag даёт 304",
+          api.raw(f"/api/news/{news_id}/image", {"If-None-Match": headers.get("ETag")})[0], 304)
+
+    # Картинка необязательна: новость без неё — это просто текст.
+    code, plain = api("POST", "/api/admin/news", {"text": "Новость без картинки"})
+    check("новость без картинки принята", code, 201)
+    feed = api("GET", "/api/news")[1]["news"]
+    check("свежая новость идёт первой", feed[0]["id"], plain.get("id"))
+    check("у неё картинки нет", feed[0]["has_image"], False)
+    check("картинки нет и по прямой ссылке",
+          api.raw(f"/api/news/{plain.get('id')}/image")[0], 404)
+
+    for label, body in [("новость без текста", {"text": "   "}),
+                        ("новость без поля text", {}),
+                        ("слишком длинный текст", {"text": "я" * 4001})]:
+        check(label + " отклонена", api("POST", "/api/admin/news", body)[0], 400)
+
+    # Картинку разбираем до вставки: иначе битый файл оставлял бы в ленте
+    # опубликованную новость и ошибку в форме одновременно.
+    check("новость с битой картинкой отклонена",
+          api("POST", "/api/admin/news",
+              {"text": "с мусором", "image": data_url(png, "image/jpeg")})[0], 400)
+    check("отклонённая новость в ленту не попала",
+          len(api("GET", "/api/news")[1]["news"]), 2)
+
+    was_created = feed[1]["created_at"]
+    was_version = feed[1]["image_v"]
+    time.sleep(1.1)      # версия картинки — это updated_at в секундах
+    check("правка новости", api("PUT", f"/api/admin/news/{news_id}",
+                                {"text": "Первая новость, исправленная",
+                                 "image": data_url(make_png(3))})[0], 200)
+    edited = next(n for n in api("GET", "/api/news")[1]["news"] if n["id"] == news_id)
+    check("текст заменён", edited["text"], "Первая новость, исправленная")
+    check("версия картинки выросла", edited["image_v"] > was_version, True)
+    check("отдаётся уже новая картинка",
+          api.raw(f"/api/news/{news_id}/image")[2] == make_png(3), True)
+    # Правка опечатки не должна поднимать новость обратно наверх ленты.
+    check("дата публикации не сдвинулась", edited["created_at"], was_created)
+
+    check("картинку новости можно убрать",
+          api("PUT", f"/api/admin/news/{news_id}",
+              {"text": "Первая новость, исправленная", "image_clear": True})[0], 200)
+    check("после этого картинки нет", api.raw(f"/api/news/{news_id}/image")[0], 404)
+    check("сама новость осталась",
+          any(n["id"] == news_id for n in api("GET", "/api/news")[1]["news"]), True)
+
+    check("удаление новости", api("DELETE", f"/api/admin/news/{news_id}")[0], 200)
+    check("повторное удаление отклонено", api("DELETE", f"/api/admin/news/{news_id}")[0], 400)
+    check("правка удалённой отклонена",
+          api("PUT", f"/api/admin/news/{news_id}", {"text": "призрак"})[0], 400)
+    check("в ленте осталась одна", len(api("GET", "/api/news")[1]["news"]), 1)
+    check("страница новостей отдаётся", api("GET", "/news")[0], 200)
+
+    print("\n9. Страницы и заголовок CSP")
     # Страницы и CSP правятся порознь, и рассогласование не видно ни в одном
     # серверном тесте: браузер просто молча не загружает ресурс. Схема blob:
     # в img-src не разрешена, поэтому createObjectURL для картинок непригоден.
@@ -473,7 +545,7 @@ async def main() -> int:
     check("CSP разрешает картинки из data:", "data:" in csp, True)
     here = os.path.dirname(os.path.abspath(__file__))
     pages = {}
-    for page in ("admin.html", "dashboard.html"):
+    for page in ("admin.html", "dashboard.html", "news.html"):
         text = open(os.path.join(here, page), encoding="utf-8").read()
         pages[page] = "\n".join(line for line in text.splitlines()
                                 if not line.lstrip().startswith("//"))   # без комментариев
@@ -490,16 +562,28 @@ async def main() -> int:
           "passThroughRaster" in admin_code, True)
     check("карточка вписывает картинку целиком, а не режет",
           "object-fit: contain" in pages["dashboard.html"], True)
+    check("картинку новости тоже не режет",
+          "object-fit: contain" in pages["news.html"], True)
 
-    print("\n9. Смена пароля и выход")
+    # Ссылка на новости — в верхнем меню каждой страницы: заводится она руками
+    # в трёх файлах, и забытая находится только глазами.
+    for page, text in pages.items():
+        check(f"{page}: в меню есть ссылка на новости",
+              'href="/news"' in text and "Новости" in text, True)
+
+    print("\n10. Смена пароля и выход")
     check("смена с неверным текущим",
           api("POST", "/api/admin/password", {"current": "nope", "password": "x" * 12})[0], 403)
     check("короткий новый пароль",
           api("POST", "/api/admin/password", {"current": PASSWORD, "password": "abc"})[0], 400)
     check("выход", api("POST", "/api/logout")[0], 200)
     check("после выхода админка закрыта", api("GET", "/api/admin/targets")[0], 401)
+    check("после выхода новости не публикуются",
+          api("POST", "/api/admin/news", {"text": "тайком"})[0], 401)
+    # Лента — публичная часть: её видно и без входа, пока не включён require_login.
+    check("читать новости выход не мешает", api("GET", "/api/news")[0], 200)
 
-    print("\n10. Миграция старых баз")
+    print("\n11. Миграция старых баз")
     # Без переноса старых записей аптайм за неделю считался бы по половине
     # колонки: у них state пуст, а SUM его пропускает.
     old_path = os.path.join(tmp, "old.db")

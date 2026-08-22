@@ -4,8 +4,9 @@ onionwatch — монитор доступности onion-сервисов (Tor
 
 У цели может быть несколько адресов: один обычный (clear) и до десяти onion.
 Каждый проверяется отдельно через SOCKS5-порт локального Tor, история пишется
-в SQLite, наружу отдаётся веб-дашборд + JSON API. Цели заводятся в админке
-(вход по логину и паролю), конфиг задаёт только инфраструктуру.
+в SQLite, наружу отдаётся веб-дашборд, страница новостей и JSON API. Цели
+и новости заводятся в админке (вход по логину и паролю), конфиг задаёт
+только инфраструктуру.
 
 Зависимости: только стандартная библиотека Python 3.11+ и запущенный tor.
 
@@ -105,6 +106,8 @@ NAME_RE = re.compile(r"^[^/\\\x00-\x1f]{1,64}$")
 MAX_ONIONS = 10               # сколько onion-зеркал можно завести одной цели
 MAX_BODY = 2 * 1024 * 1024    # в теле может приехать картинка в base64, а он на треть длиннее
 MAX_IMAGE = 1024 * 1024
+MAX_NEWS_TEXT = 4000          # новость — заметка под картинкой, а не статья
+NEWS_LIMIT = 100              # сколько новостей отдаётся на страницу
 
 # Растр обрезает и уменьшает браузер, сюда приходит готовый квадрат.
 # Сервер обязан перепроверить формат: доверять Content-Type от клиента нельзя.
@@ -400,6 +403,22 @@ def clean_target(data: dict[str, Any], cfg: Config) -> tuple[dict[str, Any], lis
     # Финальная проверка: цель должна собираться.
     row_to_target(row | {"id": 0}, cfg, [Address(u) for u in urls])
     return row, urls
+
+
+def clean_news(data: dict[str, Any]) -> str:
+    """Проверяет текст новости. Бросает Invalid с текстом для UI.
+
+    Текст хранится как есть, без разметки: страница новостей экранирует его
+    и сама разбивает по пустым строкам на абзацы. Картинка к тексту
+    необязательна — новость без неё остаётся читаемой, а вот без слов нет.
+    """
+    text = str(data.get("text", "")).replace("\r\n", "\n").strip()
+    if not text:
+        raise Invalid("Текст новости пуст — напишите хотя бы строку")
+    if len(text) > MAX_NEWS_TEXT:
+        raise Invalid(f"Текст новости длиннее {MAX_NEWS_TEXT} символов "
+                      f"(сейчас {len(text)}) — сократите его")
+    return text
 
 
 def check_svg(blob: bytes) -> None:
@@ -873,6 +892,19 @@ class Store:
                     attempts INTEGER
                 );
 
+                -- Новости: картинка и текст к ней. К целям отношения не имеют
+                -- и живут своей лентой, поэтому и таблица отдельная. Колонки
+                -- картинки те же, что у targets, — работа с ними общая.
+                CREATE TABLE IF NOT EXISTS news (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    image BLOB,
+                    image_type TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_news_created ON news(created_at DESC);
+
                 CREATE TABLE IF NOT EXISTS admins (
                     login TEXT PRIMARY KEY,
                     salt BLOB NOT NULL,
@@ -1087,33 +1119,43 @@ class Store:
             rows = self.db.execute("SELECT * FROM addr_last").fetchall()
         return {int(r["addr_id"]): dict(r) for r in rows}
 
-    def set_image(self, tid: int, blob: bytes, ctype: str) -> None:
+    # -- картинки ----------------------------------------------------------
+    # У целей и у новостей картинка устроена одинаково: блоб, его тип и
+    # updated_at. Имя таблицы в запрос попадает только отсюда, из двух пар
+    # методов ниже, — снаружи его подставить некуда.
+
+    def _put_image(self, table: str, oid: int, blob: bytes | None,
+                   ctype: str | None) -> None:
         # updated_at двигаем всегда: он попадает в URL картинки как версия,
         # иначе браузеры будут показывать старую из кэша.
         with self.lock:
             cur = self.db.execute(
-                "UPDATE targets SET image=?, image_type=?, updated_at=? WHERE id=?",
-                (blob, ctype, time.time(), tid))
+                f"UPDATE {table} SET image=?, image_type=?, updated_at=? WHERE id=?",
+                (blob, ctype, time.time(), oid))
             if not cur.rowcount:
-                raise Invalid("Цель не найдена")
+                raise Invalid("Запись не найдена")
             self.db.commit()
+
+    def _get_image(self, table: str, oid: int) -> tuple[bytes, str] | None:
+        with self.lock:
+            row = self.db.execute(
+                f"SELECT image, image_type FROM {table} WHERE id=?", (oid,)).fetchone()
+        if not row or row["image"] is None:
+            return None
+        return row["image"], row["image_type"] or "image/png"
+
+    def set_image(self, tid: int, blob: bytes, ctype: str) -> None:
+        with self.lock:
+            self._put_image("targets", tid, blob, ctype)
             self.targets_rev += 1
 
     def clear_image(self, tid: int) -> None:
         with self.lock:
-            self.db.execute(
-                "UPDATE targets SET image=NULL, image_type=NULL, updated_at=? WHERE id=?",
-                (time.time(), tid))
-            self.db.commit()
+            self._put_image("targets", tid, None, None)
             self.targets_rev += 1
 
     def image(self, tid: int) -> tuple[bytes, str] | None:
-        with self.lock:
-            row = self.db.execute(
-                "SELECT image, image_type FROM targets WHERE id=?", (tid,)).fetchone()
-        if not row or row["image"] is None:
-            return None
-        return row["image"], row["image_type"] or "image/png"
+        return self._get_image("targets", tid)
 
     def seed_targets(self, cfg: Config) -> int:
         """Разовый импорт targets[] из конфига, пока таблица пуста."""
@@ -1129,6 +1171,55 @@ class Store:
                 print(f"! цель {item.get('name')!r} из конфига не импортирована: {e}",
                       file=sys.stderr, flush=True)
         return added
+
+    # -- новости -----------------------------------------------------------
+
+    def list_news(self, limit: int = NEWS_LIMIT) -> list[dict[str, Any]]:
+        """Лента для страницы новостей: свежие сверху, без самих блобов."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id, text, created_at, updated_at,"
+                " image IS NOT NULL AS has_image FROM news"
+                " ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"id": int(r["id"]), "text": r["text"],
+                 "created_at": r["created_at"], "updated_at": r["updated_at"],
+                 "has_image": bool(r["has_image"]),
+                 "image_v": int(r["updated_at"])} for r in rows]
+
+    def add_news(self, text: str) -> int:
+        now = time.time()
+        with self.lock:
+            cur = self.db.execute(
+                "INSERT INTO news (text, created_at, updated_at) VALUES (?,?,?)",
+                (text, now, now))
+            self.db.commit()
+            return int(cur.lastrowid)
+
+    def update_news(self, nid: int, text: str) -> None:
+        with self.lock:
+            # created_at не трогаем: правка опечатки не должна поднимать
+            # новость обратно наверх ленты.
+            cur = self.db.execute("UPDATE news SET text=?, updated_at=? WHERE id=?",
+                                  (text, time.time(), nid))
+            if not cur.rowcount:
+                raise Invalid("Новость не найдена")
+            self.db.commit()
+
+    def delete_news(self, nid: int) -> None:
+        with self.lock:
+            cur = self.db.execute("DELETE FROM news WHERE id=?", (nid,))
+            if not cur.rowcount:
+                raise Invalid("Новость не найдена")
+            self.db.commit()
+
+    def set_news_image(self, nid: int, blob: bytes, ctype: str) -> None:
+        self._put_image("news", nid, blob, ctype)
+
+    def clear_news_image(self, nid: int) -> None:
+        self._put_image("news", nid, None, None)
+
+    def news_image(self, nid: int) -> tuple[bytes, str] | None:
+        return self._get_image("news", nid)
 
     # -- администраторы и сессии ------------------------------------------
 
@@ -1542,6 +1633,8 @@ def make_handler(monitor: Monitor):
                     return self._page("dashboard.html")
                 if path in ("/admin", "/admin.html"):
                     return self._page("admin.html")
+                if path in ("/news", "/news.html"):
+                    return self._page("news.html")
 
                 if path == "/api/session":
                     login = self._login()
@@ -1560,7 +1653,19 @@ def make_handler(monitor: Monitor):
                 if path.startswith("/api/targets/") and path.endswith("/image"):
                     if not self._public_ok():
                         return self._json(401, {"error": "Нужен вход"})
-                    return self._serve_image(self._target_id(path[:-len("/image")]))
+                    return self._serve_image(
+                        store.image(self._path_id(path[:-len("/image")])))
+
+                if path == "/api/news":
+                    if not self._public_ok():
+                        return self._json(401, {"error": "Нужен вход"})
+                    return self._json(200, {"news": store.list_news()})
+
+                if path.startswith("/api/news/") and path.endswith("/image"):
+                    if not self._public_ok():
+                        return self._json(401, {"error": "Нужен вход"})
+                    return self._serve_image(
+                        store.news_image(self._path_id(path[:-len("/image")])))
 
                 if path.startswith("/api/targets/") and path.endswith("/history"):
                     if not self._public_ok():
@@ -1621,6 +1726,19 @@ def make_handler(monitor: Monitor):
                     monitor.sync_targets()
                     return self._json(201, {"id": tid})
 
+                if path == "/api/admin/news":
+                    if not self._require_admin():
+                        return None
+                    data = self._body()
+                    text = clean_news(data)
+                    # Картинку разбираем до вставки: иначе битый файл оставил бы
+                    # в ленте опубликованную новость и ошибку в форме.
+                    image = self._image_of(data)
+                    nid = store.add_news(text)
+                    if image:
+                        store.set_news_image(nid, *image)
+                    return self._json(201, {"id": nid})
+
                 if path == "/api/admin/password":
                     login = self._require_admin()
                     if not login:
@@ -1642,12 +1760,26 @@ def make_handler(monitor: Monitor):
                 if path.startswith("/api/admin/targets/"):
                     if not self._require_admin():
                         return None
-                    tid = self._target_id(path)
+                    tid = self._path_id(path)
                     data = self._body()
                     row, urls = clean_target(data, cfg)
                     store.update_target(tid, row, urls)
                     self._apply_image(tid, data)
                     monitor.sync_targets()
+                    return self._json(200, {"ok": True})
+
+                if path.startswith("/api/admin/news/"):
+                    if not self._require_admin():
+                        return None
+                    nid = self._path_id(path)
+                    data = self._body()
+                    text = clean_news(data)
+                    image = self._image_of(data)
+                    store.update_news(nid, text)
+                    if image:
+                        store.set_news_image(nid, *image)
+                    elif data.get("image_clear"):
+                        store.clear_news_image(nid)
                     return self._json(200, {"ok": True})
                 return self._json(404, {"error": "Такого маршрута нет"})
             except Invalid as e:
@@ -1659,17 +1791,24 @@ def make_handler(monitor: Monitor):
                 if path.startswith("/api/admin/targets/"):
                     if not self._require_admin():
                         return None
-                    name = store.delete_target(self._target_id(path))
+                    name = store.delete_target(self._path_id(path))
                     monitor.sync_targets()
                     return self._json(200, {"deleted": name})
+
+                if path.startswith("/api/admin/news/"):
+                    if not self._require_admin():
+                        return None
+                    nid = self._path_id(path)
+                    store.delete_news(nid)
+                    return self._json(200, {"deleted": nid})
                 return self._json(404, {"error": "Такого маршрута нет"})
             except Invalid as e:
                 return self._json(400, {"error": str(e)})
 
-        def _serve_image(self, tid: int) -> None:
-            found = store.image(tid)
+        def _serve_image(self, found: tuple[bytes, str] | None) -> None:
+            """Отдаёт картинку цели или новости — они хранятся одинаково."""
             if not found:
-                return self._json(404, {"error": "У цели нет изображения"})
+                return self._json(404, {"error": "Изображения нет"})
             blob, ctype = found
             etag = '"%s"' % hashlib.sha256(blob).hexdigest()[:24]
             if self.headers.get("If-None-Match") == etag:
@@ -1690,19 +1829,23 @@ def make_handler(monitor: Monitor):
                     "default-src 'none'; style-src 'unsafe-inline'; sandbox",
             })
 
-        def _apply_image(self, tid: int, data: dict[str, Any]) -> None:
+        def _image_of(self, data: dict[str, Any]) -> tuple[bytes, str] | None:
+            """Картинка из тела запроса, если её прислали."""
             raw = data.get("image")
-            if raw:
-                blob, ctype = parse_image(raw)
-                store.set_image(tid, blob, ctype)
+            return parse_image(raw) if raw else None
+
+        def _apply_image(self, tid: int, data: dict[str, Any]) -> None:
+            image = self._image_of(data)
+            if image:
+                store.set_image(tid, *image)
             elif data.get("image_clear"):
                 store.clear_image(tid)
 
-        def _target_id(self, path: str) -> int:
+        def _path_id(self, path: str) -> int:
             try:
                 return int(path.rsplit("/", 1)[1])
             except (IndexError, ValueError) as e:
-                raise Invalid("Не разобран идентификатор цели") from e
+                raise Invalid("Не разобран идентификатор в адресе") from e
 
         def _login_route(self) -> None:
             ip = self._client_ip()

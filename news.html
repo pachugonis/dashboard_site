@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>onionwatch — новости</title>
+<style>
+  :root {
+    --ink: #0f1220;
+    --panel: #161a2c;
+    --panel-2: #1c2138;
+    --line: #272d4a;
+    --text: #e7e9f5;
+    --muted: #949bc4;
+    --dim: #5d6390;
+    --down: #ff5d73;
+    --circuit: #8f7bff;
+    --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ink); color: var(--text); font-family: var(--sans);
+    font-size: 15px; line-height: 1.5;
+    background-image: radial-gradient(circle at 15% -10%, #1d2244 0%, transparent 55%);
+    background-attachment: fixed;
+  }
+  /* Лента читается, а не просматривается: колонка уже дашбордной. */
+  .wrap { max-width: 820px; margin: 0 auto; padding: 28px 20px 64px; }
+
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--dim); }
+  h1 { font-size: 26px; margin: 4px 0 0; font-weight: 620; letter-spacing: -.01em; }
+  h1 span { color: var(--circuit); }
+  header.top { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end;
+    justify-content: space-between; border-bottom: 1px solid var(--line); padding-bottom: 18px; }
+  .top-right { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+
+  /* Верхнее меню: одинаковое на всех страницах. */
+  nav.nav { display: flex; gap: 6px; flex-wrap: wrap; }
+  nav.nav a { font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+    text-decoration: none; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; }
+  nav.nav a:hover { background: var(--panel-2); border-color: #3a4270; color: var(--text); }
+  nav.nav a[aria-current="page"] { color: #fff; border-color: var(--circuit);
+    background: linear-gradient(var(--panel-2), var(--panel)); }
+  :focus-visible { outline: 2px solid var(--circuit); outline-offset: 2px; }
+
+  .feed { display: flex; flex-direction: column; gap: 16px; margin-top: 22px; }
+  .post { background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px 18px; }
+  .when { font-family: var(--mono); font-size: 11px; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--dim); }
+  /* Картинку новости не режем: она часть сообщения, а не аватар. Ширину берёт
+     по колонке, высоту ограничиваем, чтобы вертикальный кадр не занимал экран. */
+  .shot { display: block; width: 100%; height: auto; max-height: 460px;
+    object-fit: contain; border-radius: 10px; border: 1px solid var(--line);
+    background: var(--panel-2); margin: 12px 0 4px; }
+  .body { font-size: 15.5px; }
+  .body p { margin: 12px 0 0; overflow-wrap: anywhere; }
+
+  .empty-state { border: 1px dashed var(--line); border-radius: 12px; padding: 44px 24px;
+    text-align: center; color: var(--muted); }
+  .empty-state a { color: var(--circuit); }
+  .banner { border: 1px solid var(--down); background: rgba(255,93,115,.08);
+    border-radius: 10px; padding: 12px 16px; margin-top: 18px; font-size: 14px; }
+  footer { margin-top: 26px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div>
+      <div class="eyebrow">Что нового</div>
+      <h1>onion<span>watch</span> — новости</h1>
+    </div>
+    <div class="top-right">
+      <nav class="nav" aria-label="Разделы">
+        <a href="/">Дашборд</a>
+        <a href="/news" aria-current="page">Новости</a>
+        <a href="/admin">Админка</a>
+      </nav>
+    </div>
+  </header>
+
+  <div id="banner"></div>
+  <div class="feed" id="feed"></div>
+
+  <footer>новости публикуются в админке · картинка и текст к ней</footer>
+</div>
+
+<script>
+const el = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+const when = ts => new Date(ts * 1000).toLocaleString("ru-RU",
+  { day: "numeric", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit" });
+
+// Разметки в тексте нет — есть переносы строк, которые автор расставил сам.
+// Пустая строка разбивает на абзацы, одиночная остаётся переносом.
+const paragraphs = text => esc(text).split(/\n{2,}/)
+  .map(p => `<p>${p.replace(/\n/g, "<br>")}</p>`).join("");
+
+function post(n) {
+  // Версия в URL — updated_at: без неё после замены картинки браузер показал бы
+  // старую из кэша, а кэш здесь нарочно долгий.
+  const shot = n.has_image
+    ? `<img class="shot" src="/api/news/${n.id}/image?v=${n.image_v}" alt="Изображение к новости">`
+    : "";
+  return `<article class="post" id="n${n.id}">
+    <div class="when">${esc(when(n.created_at))}</div>
+    ${shot}
+    <div class="body">${paragraphs(n.text)}</div>
+  </article>`;
+}
+
+async function load() {
+  try {
+    const r = await fetch("/api/news", { cache: "no-store" });
+    if (r.status === 401) { location.href = "/admin"; return; }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const data = await r.json();
+    el("feed").innerHTML = data.news.length ? data.news.map(post).join("")
+      : `<div class="empty-state">Новостей пока нет.<br>
+         Первую можно опубликовать в <a href="/admin">админке</a>.</div>`;
+  } catch (e) {
+    el("banner").innerHTML =
+      `<div class="banner">Новости не загрузились: ${esc(e.message)}.
+       Проверьте, что процесс onionwatch запущен.</div>`;
+  }
+}
+
+load();
+</script>
+</body>
+</html>

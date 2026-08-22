@@ -41,6 +41,7 @@
 
   header.top { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end;
     justify-content: space-between; border-bottom: 1px solid var(--line); padding-bottom: 18px; }
+  .top-right { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
   h1 { font-size: 26px; margin: 4px 0 0; font-weight: 620; letter-spacing: -.01em; }
   h1 span { color: var(--circuit); }
   .meta { display: flex; gap: 22px; flex-wrap: wrap; align-items: center;
@@ -51,6 +52,15 @@
     margin-right: 7px; vertical-align: 1px; background: var(--dim); }
   .dot.on { background: var(--up); box-shadow: 0 0 0 3px rgba(62,207,160,.16); }
   .dot.off { background: var(--down); box-shadow: 0 0 0 3px rgba(255,93,115,.16); }
+
+  /* Верхнее меню: одинаковое на всех страницах. */
+  nav.nav { display: flex; gap: 6px; flex-wrap: wrap; }
+  nav.nav a { font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+    text-decoration: none; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; }
+  nav.nav a:hover { background: var(--panel-2); border-color: #3a4270; color: var(--text); }
+  nav.nav a[aria-current="page"] { color: #fff; border-color: var(--circuit);
+    background: linear-gradient(var(--panel-2), var(--panel)); }
 
   /* Сводка: три числа, которыми дашборд открывается. */
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -181,7 +191,14 @@
       <div class="eyebrow">Мониторинг скрытых сервисов</div>
       <h1>onion<span>watch</span></h1>
     </div>
-    <div class="meta" id="meta"></div>
+    <div class="top-right">
+      <nav class="nav" aria-label="Разделы">
+        <a href="/" aria-current="page">Дашборд</a>
+        <a href="/news">Новости</a>
+        <a href="/admin">Админка</a>
+      </nav>
+      <div class="meta" id="meta"></div>
+    </div>
   </header>
 
   <section class="kpis" id="kpis" aria-label="Сводка"></section>
@@ -191,7 +208,6 @@
     <button class="btn" id="only-bad" aria-pressed="false">Только проблемные</button>
     <button class="btn" id="refresh">Обновить</button>
     <button class="btn" id="auto" aria-pressed="true">Автообновление: вкл</button>
-    <a class="btn" href="/admin">Админка</a>
   </div>
 
   <div id="banner"></div>
