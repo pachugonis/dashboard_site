@@ -114,6 +114,12 @@ MAX_SOURCE_URL = 500          # ссылка на первоисточник н�
 NEWS_PER_PAGE = 10            # сколько новостей на одной странице ленты
 NEWS_ADMIN_LIMIT = 500        # сколько новостей видит админка — там они правятся списком
 
+# Статистика: окно графика и длина списков под ним. Дней не больше, чем хранит
+# история (retention_days, по умолчанию 30), иначе левый край графика пуст.
+STATS_DAYS = 14
+STATS_TOP_ERRORS = 8          # сколько причин недоступности показывать
+STATS_RECENT = 8              # сколько последних отказов показывать
+
 # Растр обрезает и уменьшает браузер, сюда приходит готовый квадрат.
 # Сервер обязан перепроверить формат: доверять Content-Type от клиента нельзя.
 # SVG — исключение: он вектор, обрезать в нём по пикселям нечего, и приходит он
@@ -1039,6 +1045,132 @@ class Store:
             "avg_circuit_ms": round(row["conn"], 0) if row["conn"] else None,
         }
 
+    def summary_all(self, names: list[str], window_s: float) -> dict[str, Any]:
+        """То же, что summary, но по списку целей сразу: аптайм считается по
+        всем проверкам вместе, поэтому редко проверяемая цель и весит меньше."""
+        if not names:
+            return {"checks": 0, "uptime": None, "avg_ttfb_ms": None, "avg_circuit_ms": None}
+        since = time.time() - window_s
+        marks = ",".join("?" * len(names))
+        with self.lock:
+            row = self.db.execute(
+                "SELECT COUNT(*) n, SUM(state<>'down') alive,"
+                " AVG(CASE WHEN state<>'down' THEN ttfb_ms END) ttfb,"
+                " AVG(CASE WHEN state<>'down' THEN connect_ms END) conn"
+                f" FROM checks WHERE ts>=? AND target IN ({marks})",
+                [since] + list(names)).fetchone()
+        n = row["n"] or 0
+        return {
+            "checks": n,
+            "uptime": round(100.0 * (row["alive"] or 0) / n, 2) if n else None,
+            "avg_ttfb_ms": round(row["ttfb"], 0) if row["ttfb"] else None,
+            "avg_circuit_ms": round(row["conn"], 0) if row["conn"] else None,
+        }
+
+    def day_labels(self, days: int) -> list[str]:
+        """Последние `days` календарных дней, включая сегодняшний, по местному
+        времени сервера. Полдень как опорная точка — иначе перевод часов
+        сдвигает сутки и один день в списке повторяется."""
+        lt = time.localtime()
+        midnight = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+        return [time.strftime("%Y-%m-%d",
+                              time.localtime(midnight + 43200 - i * 86400))
+                for i in reversed(range(days))]
+
+    def stats(self, names: list[str], days: int = STATS_DAYS) -> dict[str, Any]:
+        """Цифры для страницы статистики: по дням, по целям и по причинам.
+
+        Считается только по целям, которые заведены сейчас: история удалённой
+        цели остаётся в базе, и без этого фильтра страница показывала бы то,
+        чего на дашборде уже нет. Историю чистит prune, поэтому окно графика
+        не может быть длиннее retention_days — за краем будут пустые дни.
+        """
+        labels = self.day_labels(days)
+        blank = [{"day": d, "checks": 0, "alive": 0, "uptime": None, "ttfb": None}
+                 for d in labels]
+        empty = {"window_days": days, "days": blank, "targets": [],
+                 "errors": [], "recent": [], "checks_total": 0, "since": None}
+        if not names:
+            return empty
+        # Полночь первого дня окна: границы дней считает та же местная зона,
+        # что и date(...,'localtime') в запросах ниже.
+        since = time.mktime(time.strptime(labels[0], "%Y-%m-%d"))
+        week = time.time() - 7 * 86400
+        marks = ",".join("?" * len(names))
+        args = list(names)
+
+        with self.lock:
+            by_day = {r["day"]: r for r in self.db.execute(
+                "SELECT date(ts,'unixepoch','localtime') day, COUNT(*) n,"
+                " SUM(state<>'down') alive,"
+                " AVG(CASE WHEN state<>'down' THEN ttfb_ms END) ttfb"
+                f" FROM checks WHERE ts>=? AND target IN ({marks})"
+                " GROUP BY day", [since] + args).fetchall()}
+
+            # По целям — за неделю: сутки на странице уже есть на дашборде,
+            # а разъехавшиеся цели видно как раз на недельном окне.
+            per_target = {r["target"]: r for r in self.db.execute(
+                "SELECT target, COUNT(*) n, SUM(state<>'down') alive,"
+                " AVG(CASE WHEN state<>'down' THEN ttfb_ms END) ttfb,"
+                " AVG(CASE WHEN state<>'down' THEN connect_ms END) conn"
+                f" FROM checks WHERE ts>=? AND target IN ({marks})"
+                " GROUP BY target", [week] + args).fetchall()}
+
+            # Инцидент — переход в недоступность, а не каждая красная проверка:
+            # цель, лежавшая сутки, — это один инцидент, а не три сотни.
+            incidents = {r["target"]: r["n"] for r in self.db.execute(
+                "SELECT target, COUNT(*) n FROM ("
+                "  SELECT target, state, LAG(state) OVER"
+                "         (PARTITION BY target ORDER BY ts) prev"
+                f"  FROM checks WHERE ts>=? AND target IN ({marks}))"
+                " WHERE state='down' AND (prev IS NULL OR prev<>'down')"
+                " GROUP BY target", [week] + args).fetchall()}
+
+            errors = [{"slug": r["slug"], "checks": r["n"]} for r in self.db.execute(
+                "SELECT COALESCE(error_slug,'unknown') slug, COUNT(*) n FROM checks"
+                f" WHERE ts>=? AND state='down' AND target IN ({marks})"
+                " GROUP BY slug ORDER BY n DESC, slug LIMIT ?",
+                [week] + args + [STATS_TOP_ERRORS]).fetchall()]
+
+            recent = [dict(r) for r in self.db.execute(
+                "SELECT target, ts, error_slug, error, attempts FROM checks"
+                f" WHERE state='down' AND target IN ({marks})"
+                " ORDER BY ts DESC LIMIT ?", args + [STATS_RECENT]).fetchall()]
+
+            row = self.db.execute(
+                f"SELECT COUNT(*) n, MIN(ts) first FROM checks WHERE target IN ({marks})",
+                args).fetchone()
+
+        def uptime(n, alive):
+            return round(100.0 * (alive or 0) / n, 2) if n else None
+
+        for d in blank:
+            r = by_day.get(d["day"])
+            if not r:
+                continue
+            d["checks"] = r["n"]
+            d["alive"] = r["alive"] or 0
+            d["uptime"] = uptime(r["n"], r["alive"])
+            d["ttfb"] = round(r["ttfb"], 0) if r["ttfb"] else None
+
+        targets = []
+        for name in names:
+            r = per_target.get(name)
+            n = r["n"] if r else 0
+            targets.append({
+                "name": name,
+                "checks": n,
+                "down": n - (r["alive"] or 0) if r else 0,
+                "uptime": uptime(n, r["alive"]) if r else None,
+                "avg_ttfb_ms": round(r["ttfb"], 0) if r and r["ttfb"] else None,
+                "avg_circuit_ms": round(r["conn"], 0) if r and r["conn"] else None,
+                "incidents": int(incidents.get(name, 0)),
+            })
+
+        return {"window_days": days, "days": blank, "targets": targets,
+                "errors": errors, "recent": recent,
+                "checks_total": int(row["n"] or 0), "since": row["first"]}
+
     # -- цели --------------------------------------------------------------
 
     def list_targets(self, cfg: Config, enabled_only: bool = False) -> list[Target]:
@@ -1501,11 +1633,7 @@ class Monitor:
                 "week": self.store.summary(t.name, 7 * 86400),
                 "history": self.store.history(t.name, 60),
             })
-        # У записей, сделанных до появления поля state, его нет.
-        marks = [("pending" if not x["last"] else
-                  "down" if (x["last"].get("state") or ("up" if x["last"].get("ok") else "down"))
-                  == "down" else "up")
-                 for x in out]
+        marks = [self._mark(x["last"]) for x in out]
         return {
             "generated_at": time.time(),
             "started_at": self.started_at,
@@ -1516,6 +1644,63 @@ class Monitor:
             "pending": marks.count("pending"),
             "total": len(out),
             "targets": out,
+        }
+
+    @staticmethod
+    def _mark(last: dict[str, Any] | None) -> str:
+        """Состояние по последней проверке: доступна, недоступна или ещё не
+        проверялась. У записей, сделанных до появления поля state, его нет."""
+        if not last:
+            return "pending"
+        state = last.get("state") or ("up" if last.get("ok") else "down")
+        return "down" if state == "down" else "up"
+
+    def mark(self, t: Target) -> str:
+        """То же для цели: последняя проверка берётся из памяти, а после
+        перезапуска демона — из базы."""
+        last = self.last.get(t.name)
+        if last is None:
+            rows = self.store.history(t.name, 1)
+            last = rows[-1] if rows else None
+        return self._mark(last)
+
+    def stats(self, days: int = STATS_DAYS) -> dict[str, Any]:
+        """Сводка для страницы статистики: то же, что на дашборде, но одним
+        числом на весь список целей, плюс разбивка по дням и по причинам."""
+        self.sync_targets()
+        targets = list(self.targets.values())
+        marks = [self.mark(t) for t in targets]
+        addresses = [a for t in targets for a in t.addresses]
+        onions = sum(1 for a in addresses if a.kind == "onion")
+
+        data = self.store.stats([t.name for t in targets], days)
+        # Аптайм по всему списку сразу: доля проверок, а не среднее по целям —
+        # иначе цель, которую проверяют раз в час, весила бы столько же,
+        # сколько проверяемая каждые пять минут.
+        for key, window in (("day", 86400), ("week", 7 * 86400)):
+            data[key] = self.store.summary_all([t.name for t in targets], window)
+        by_name = {t.name: t for t in targets}
+        for row in data["targets"]:
+            t = by_name[row["name"]]
+            row["state"] = self.mark(t)
+            row["addresses"] = len(t.addresses)
+            row["interval"] = t.interval
+        return data | {
+            "generated_at": time.time(),
+            "started_at": self.started_at,
+            "tor_ok": self.tor_alive(),
+            "tor_socks": f"{self.cfg.tor_socks[0]}:{self.cfg.tor_socks[1]}",
+            "retention_days": self.cfg.retention_days,
+            "now": {
+                "targets": len(targets),
+                "up": marks.count("up"),
+                "down": marks.count("down"),
+                "pending": marks.count("pending"),
+                "addresses": len(addresses),
+                "onion": onions,
+                "clear": len(addresses) - onions,
+                "incidents": sum(r["incidents"] for r in data["targets"]),
+            },
         }
 
 
@@ -1678,6 +1863,8 @@ def make_handler(monitor: Monitor):
                     return self._page("admin.html")
                 if path in ("/news", "/news.html"):
                     return self._page("news.html")
+                if path in ("/stats", "/stats.html"):
+                    return self._page("stats.html")
 
                 if path == "/api/session":
                     login = self._login()
@@ -1692,6 +1879,11 @@ def make_handler(monitor: Monitor):
                     if not self._public_ok():
                         return self._json(401, {"error": "Нужен вход"})
                     return self._json(200, monitor.state())
+
+                if path == "/api/stats":
+                    if not self._public_ok():
+                        return self._json(401, {"error": "Нужен вход"})
+                    return self._json(200, monitor.stats())
 
                 if path.startswith("/api/targets/") and path.endswith("/image"):
                     if not self._public_ok():

@@ -288,6 +288,42 @@ async def main() -> int:
     check("onion-адрес подписан коротко",
           mirrors["addresses"][1]["label"], "aaaaaaaa…aaaaaaaa.onion")
 
+    print("\n2а. Статистика")
+    code, st = api("GET", "/api/stats")
+    check("/api/stats отвечает", code, 200)
+    check("страница статистики отдаётся", api("GET", "/stats")[0], 200)
+    check("состояния те же, что на дашборде",
+          (st["now"]["targets"], st["now"]["up"], st["now"]["down"]), (10, 7, 3))
+    check("адреса посчитаны по видам",
+          st["now"]["onion"] + st["now"]["clear"], st["now"]["addresses"])
+    # Аптайм по всему списку — доля проверок, а не среднее по целям: у семи
+    # живых целей по две проверки, у трёх мёртвых — тоже по две.
+    check("аптайм за сутки считается по всем проверкам",
+          (st["day"]["checks"], st["day"]["uptime"]), (20, 70.0))
+    check("график покрывает две недели, последний день — сегодняшний",
+          (len(st["days"]), st["days"][-1]["day"]),
+          (ow.STATS_DAYS, time.strftime("%Y-%m-%d")))
+    check("сегодняшний день на графике — это сегодняшние проверки",
+          (st["days"][-1]["checks"], st["days"][-1]["alive"]), (20, 14))
+    # Инцидент — переход в недоступность, а не каждая красная проверка:
+    # у трёх упавших целей по две проверки подряд, а инцидент один на цель.
+    check("инциденты считаются переходами, а не проверками", st["now"]["incidents"], 3)
+    check("причины отказов разложены по слугам",
+          sum(e["checks"] for e in st["errors"]), 6)
+    check("в списке отказов — только упавшие цели",
+          {r["target"] for r in st["recent"]},
+          {t["name"] for t in state["targets"]
+           if t["last"]["state"] == "down"})
+    check("у каждой цели своя строка", len(st["targets"]), 10)
+    # История удалённой цели остаётся в базе, но в статистику попадать не должна:
+    # иначе страница показывала бы цифры по тому, чего на дашборде уже нет.
+    check("считается только по переданным целям",
+          (store.stats(["зеркала"])["checks_total"], store.stats([])["checks_total"]), (2, 0))
+    check("у цели без истории аптайма нет, а строка есть",
+          store.stats(["нет-такой"])["targets"],
+          [{"name": "нет-такой", "checks": 0, "down": 0, "uptime": None,
+            "avg_ttfb_ms": None, "avg_circuit_ms": None, "incidents": 0}])
+
     print("\n3. Админка закрыта до входа")
     check("список целей без сессии", api("GET", "/api/admin/targets")[0], 401)
     check("создание цели без сессии", api("POST", "/api/admin/targets", {"url": "x"})[0], 401)
@@ -628,7 +664,7 @@ async def main() -> int:
     check("CSP разрешает картинки из data:", "data:" in csp, True)
     here = os.path.dirname(os.path.abspath(__file__))
     pages = {}
-    for page in ("admin.html", "dashboard.html", "news.html"):
+    for page in ("admin.html", "dashboard.html", "news.html", "stats.html"):
         text = open(os.path.join(here, page), encoding="utf-8").read()
         pages[page] = "\n".join(line for line in text.splitlines()
                                 if not line.lstrip().startswith("//"))   # без комментариев
@@ -663,11 +699,23 @@ async def main() -> int:
     check("источник открывается в новом окне и без opener",
           'target="_blank"' in news_code and "noopener" in news_code, True)
 
-    # Ссылка на новости — в верхнем меню каждой страницы: заводится она руками
-    # в трёх файлах, и забытая находится только глазами.
+    # Ссылки на разделы — в верхнем меню каждой страницы: заводятся они руками
+    # в каждом файле, и забытая находится только глазами.
     for page, text in pages.items():
         check(f"{page}: в меню есть ссылка на новости",
               'href="/news"' in text and "Новости" in text, True)
+        check(f"{page}: в меню есть ссылка на статистику",
+              'href="/stats"' in text and "Статистика" in text, True)
+
+    # График рисуется цветами темы, а не своими: с переключателем он обязан
+    # перерисовываться, иначе в светлой теме останутся тёмные линии.
+    stats_code = pages["stats.html"]
+    check("статистика шириной с дашборд",
+          width("stats.html"), width("dashboard.html"))
+    check("график берёт цвета из темы и перерисовывается с ней",
+          "getPropertyValue" in stats_code and stats_code.count("redraw()") > 2, True)
+    check("день на графике разбирается сам, а не через Date",
+          "dayLabel" in stats_code and "new Date(s)" not in stats_code, True)
 
     # Тема тоже заведена руками в трёх файлах: кнопка в меню, набор переменных
     # под светлую тему и выбор темы до первой отрисовки. Забыть одно из трёх на

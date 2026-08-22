@@ -8,7 +8,7 @@
 <script>
   // Тема выбирается до первой отрисовки: иначе светлая страница успела бы
   // мигнуть тёмной. Выбор пользователя лежит в localStorage; без выбора берём
-  // системный. Скрипт повторён на всех трёх страницах — общего файла тут нет.
+  // системный. Скрипт повторён на всех страницах — общего файла тут нет.
   (function () {
     var saved = null;
     try { saved = localStorage.getItem("ow-theme"); } catch (e) { /* приватный режим */ }
@@ -164,6 +164,7 @@
       <nav class="nav" aria-label="Разделы">
         <a href="/">Дашборд</a>
         <a href="/news" aria-current="page">Новости</a>
+        <a href="/stats">Статистика</a>
         <a href="/admin" data-admin hidden>Админка</a>
         <button type="button" class="theme" id="theme">
           <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"

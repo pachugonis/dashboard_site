@@ -5,7 +5,8 @@
 
 **Что понадобится:** VPS с Ubuntu 24.04 LTS (хватит 1 vCPU / 512 МБ RAM / 5 ГБ
 диска), доступ по SSH с правами sudo, файлы `onionwatch.py`, `dashboard.html`,
-`admin.html`, `news.html`, `config.example.json`, `onionwatch.service`, `install.sh`.
+`admin.html`, `news.html`, `stats.html`, `config.example.json`, `onionwatch.service`,
+`install.sh`.
 
 **Время:** 15–20 минут.
 
@@ -13,7 +14,7 @@
 
 | Путь | Что там |
 |---|---|
-| `/opt/onionwatch/` | код: `onionwatch.py`, `dashboard.html`, `admin.html`, `news.html` (только чтение) |
+| `/opt/onionwatch/` | код: `onionwatch.py`, `dashboard.html`, `admin.html`, `news.html`, `stats.html` (только чтение) |
 | `/etc/onionwatch/config.json` | конфиг: порты и таймауты, `0640 root:onionwatch` |
 | `/var/lib/onionwatch/onionwatch.db` | цели, история проверок, администраторы (SQLite) |
 | `/etc/systemd/system/onionwatch.service` | юнит автозапуска |
@@ -171,7 +172,7 @@ Python в Ubuntu 24.04 — 3.12, этого достаточно; ставить
 Скопируйте файлы на сервер с локальной машины:
 
 ```bash
-scp onionwatch.py dashboard.html admin.html news.html config.example.json onionwatch.service \
+scp onionwatch.py dashboard.html admin.html news.html stats.html config.example.json onionwatch.service \
     install.sh README.md admin@<IP-сервера>:~/onionwatch/
 ```
 
@@ -205,6 +206,7 @@ sudo install -o root -g root -m 0644 onionwatch.py  /opt/onionwatch/
 sudo install -o root -g root -m 0644 dashboard.html /opt/onionwatch/
 sudo install -o root -g root -m 0644 admin.html     /opt/onionwatch/
 sudo install -o root -g root -m 0644 news.html      /opt/onionwatch/
+sudo install -o root -g root -m 0644 stats.html     /opt/onionwatch/
 
 # конфиг
 sudo install -o root -g onionwatch -m 0640 config.example.json /etc/onionwatch/config.json
@@ -632,11 +634,12 @@ journalctl -u tor@default --since today  # проблемы самой сети 
 **Обновление кода**
 
 ```bash
-scp onionwatch.py dashboard.html admin.html news.html admin@<IP>:~/onionwatch/
+scp onionwatch.py dashboard.html admin.html news.html stats.html admin@<IP>:~/onionwatch/
 sudo install -o root -g root -m 0644 ~/onionwatch/onionwatch.py  /opt/onionwatch/
 sudo install -o root -g root -m 0644 ~/onionwatch/dashboard.html /opt/onionwatch/
 sudo install -o root -g root -m 0644 ~/onionwatch/admin.html     /opt/onionwatch/
 sudo install -o root -g root -m 0644 ~/onionwatch/news.html      /opt/onionwatch/
+sudo install -o root -g root -m 0644 ~/onionwatch/stats.html     /opt/onionwatch/
 sudo systemctl restart onionwatch
 ```
 

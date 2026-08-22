@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>onionwatch — статистика</title>
+<script>
+  // Тема выбирается до первой отрисовки: иначе светлая страница успела бы
+  // мигнуть тёмной. Выбор пользователя лежит в localStorage; без выбора берём
+  // системный. Скрипт повторён на всех страницах — общего файла тут нет.
+  (function () {
+    var saved = null;
+    try { saved = localStorage.getItem("ow-theme"); } catch (e) { /* приватный режим */ }
+    var light = saved ? saved === "light"
+      : !!(window.matchMedia && matchMedia("(prefers-color-scheme: light)").matches);
+    document.documentElement.dataset.theme = light ? "light" : "dark";
+  })();
+</script>
+<style>
+  /* Значения те же, что на дашборде: страницы одного сайта, темы у них общие. */
+  :root {
+    color-scheme: dark;
+    --ink: #0f1220;
+    --panel: #161a2c;
+    --panel-2: #1c2138;
+    --line: #272d4a;
+    --line-hi: #3a4270;
+    --text: #e7e9f5;
+    --muted: #949bc4;
+    --dim: #5d6390;
+    --glow: #1d2244;
+    --active-ink: #fff;
+    --up: #3ecfa0;
+    --down: #ff5d73;
+    --slow: #f2b64c;
+    --up-wash: rgba(62,207,160,.09);
+    --down-wash: rgba(255,93,115,.08);
+    --up-ring: rgba(62,207,160,.16);
+    --down-ring: rgba(255,93,115,.16);
+    --circuit: #8f7bff;
+    --svc: #31a883;
+    --mono: ui-monospace, "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  }
+  html[data-theme="light"] {
+    color-scheme: light;
+    --ink: #f2f4fb;
+    --panel: #fff;
+    --panel-2: #f1f3fb;
+    --line: #d9dcee;
+    --line-hi: #b3b8d8;
+    --text: #171a2e;
+    --muted: #545a80;
+    --dim: #63688c;
+    --glow: #e3e6fb;
+    --active-ink: #3b23a8;
+    --up: #0b7856;
+    --down: #cf1f3c;
+    --slow: #96620a;
+    --up-wash: rgba(11,120,86,.08);
+    --down-wash: rgba(207,31,60,.07);
+    --up-ring: rgba(11,120,86,.18);
+    --down-ring: rgba(207,31,60,.18);
+    --circuit: #5b3fd6;
+    --svc: #10826a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--ink); color: var(--text); font-family: var(--sans);
+    font-size: 15px; line-height: 1.5;
+    background-image: radial-gradient(circle at 15% -10%, var(--glow) 0%, transparent 55%);
+    background-attachment: fixed;
+  }
+  /* Та же ширина, что у дашборда: страницы одного сайта не должны разъезжаться. */
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 28px 20px 64px; }
+
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .18em;
+    text-transform: uppercase; color: var(--dim); }
+  h1 { font-size: 26px; margin: 4px 0 0; font-weight: 620; letter-spacing: -.01em; }
+  h1 span { color: var(--circuit); }
+  header.top { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-end;
+    justify-content: space-between; border-bottom: 1px solid var(--line); padding-bottom: 18px; }
+  .top-right { display: flex; flex-direction: column; align-items: flex-end; gap: 10px; }
+  .meta { display: flex; gap: 22px; flex-wrap: wrap; align-items: center;
+    font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block;
+    margin-right: 7px; vertical-align: 1px; background: var(--dim); }
+  .dot.on { background: var(--up); box-shadow: 0 0 0 3px var(--up-ring); }
+  .dot.off { background: var(--down); box-shadow: 0 0 0 3px var(--down-ring); }
+
+  /* Верхнее меню: одинаковое на всех страницах. */
+  nav.nav { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  nav.nav a { font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+    text-decoration: none; color: var(--muted); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 12px; }
+  nav.nav a:hover { background: var(--panel-2); border-color: var(--line-hi); color: var(--text); }
+  nav.nav a[aria-current="page"] { color: var(--active-ink); border-color: var(--circuit);
+    background: linear-gradient(var(--panel-2), var(--panel)); }
+  nav.nav a[hidden] { display: none; }
+  /* Переключатель темы: квадрат ровно в высоту соседних ссылок (18px строки
+     плюс 7+7 отступа плюс рамка). Иконка показывает, куда переключит, а не
+     что включено сейчас: нажимают ради второго состояния. */
+  nav.nav .theme { width: 34px; height: 34px; padding: 0; flex: none; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--muted); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 8px; }
+  nav.nav .theme:hover { background: var(--panel-2); border-color: var(--line-hi); color: var(--text); }
+  nav.nav .theme svg { width: 16px; height: 16px; display: block; }
+  nav.nav .theme .i-moon { display: none; }
+  html[data-theme="light"] nav.nav .theme .i-sun { display: none; }
+  html[data-theme="light"] nav.nav .theme .i-moon { display: block; }
+  :focus-visible { outline: 2px solid var(--circuit); outline-offset: 2px; }
+
+  /* Плитка с одним числом. Подпись сверху говорит, что это за число, строка
+     снизу — за какой срок и по чему считано: без неё «99,4%» ни о чём. */
+  .tiles { display: grid; gap: 10px; margin: 22px 0 0;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px 16px; min-width: 0; }
+  .k { font-family: var(--mono); font-size: 10px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--dim); }
+  .n { font-size: 32px; line-height: 1.1; font-weight: 600; letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums; margin: 6px 0 2px; }
+  .n.good { color: var(--up); } .n.warn { color: var(--slow); } .n.bad { color: var(--down); }
+  .n.none { color: var(--dim); }
+  .s { font-size: 12.5px; color: var(--dim); }
+
+  h2 { font-size: 17px; font-weight: 600; margin: 26px 0 10px; letter-spacing: -.01em; }
+  .cols { display: grid; gap: 12px; margin-top: 12px;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+
+  /* График. Подписи осей рисует сам canvas, подсказка — обычный div поверх:
+     на канве её пришлось бы перерисовывать вместе с данными. */
+  .plot { position: relative; margin-top: 8px; }
+  .plot canvas { display: block; width: 100%; }
+  .tip { position: absolute; pointer-events: none; opacity: 0; transform: translate(-50%, -100%);
+    background: var(--panel-2); border: 1px solid var(--line-hi); border-radius: 8px;
+    padding: 7px 10px; font-family: var(--mono); font-size: 11px; color: var(--text);
+    white-space: nowrap; z-index: 2; }
+  .tip.on { opacity: 1; }
+  .tip b { color: var(--muted); font-weight: 400; }
+  .axis { font-family: var(--mono); font-size: 10px; letter-spacing: .06em;
+    text-transform: uppercase; color: var(--dim); margin-top: 8px;
+    display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .axis .sw { display: inline-block; width: 7px; height: 7px; border-radius: 2px;
+    margin-right: 5px; vertical-align: 0; }
+
+  /* Строка списка: имя, полоса и число. Полоса — доля от наибольшего значения
+     в списке, поэтому у неё нет своей подписи: число рядом. */
+  .row { display: flex; align-items: center; gap: 9px; font-size: 12.5px; margin-top: 7px; }
+  .row .who { width: 40%; min-width: 0; color: var(--muted); font-family: var(--mono);
+    font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .bar { flex: 1 1 auto; height: 8px; border-radius: 3px; background: var(--panel-2);
+    border: 1px solid var(--line); overflow: hidden; }
+  .row .bar i { display: block; height: 100%; background: var(--circuit); opacity: .75; }
+  .row .bar.warn i { background: var(--slow); }
+  .row .bar.bad i { background: var(--down); }
+  .row .bar.good i { background: var(--up); }
+  .row .num { flex: none; width: 74px; text-align: right; font-family: var(--mono);
+    font-size: 11.5px; color: var(--text); font-variant-numeric: tabular-nums; }
+
+  /* Последние отказы: время, цель и причина одной строкой. */
+  .events { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+  .event { display: flex; gap: 10px; align-items: baseline; font-size: 13px; min-width: 0; }
+  .event .when { flex: none; font-family: var(--mono); font-size: 11px; color: var(--dim);
+    width: 92px; }
+  .event .who { font-weight: 600; }
+  .event .why { color: var(--muted); overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; min-width: 0; }
+  .live { display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap; }
+  .live .n { margin: 0; }
+
+  /* Разбивка целей по состояниям: одна полоса на три доли. Между долями
+     просвет в фон панели, иначе соседние цвета читаются как один. */
+  .split { display: flex; height: 8px; gap: 2px; margin: 12px 0 8px; }
+  .split i { border-radius: 3px; min-width: 3px; }
+  .split .up { background: var(--up); }
+  .split .down { background: var(--down); }
+  .split .pending { background: var(--dim); }
+  .legend { font-family: var(--mono); font-size: 11px; color: var(--muted);
+    display: flex; gap: 16px; flex-wrap: wrap; }
+  .legend .sw { display: inline-block; width: 7px; height: 7px; border-radius: 2px;
+    margin-right: 5px; vertical-align: 0; }
+
+  .empty-state { border: 1px dashed var(--line); border-radius: 12px; padding: 44px 24px;
+    text-align: center; color: var(--muted); }
+  .empty-state a { color: var(--circuit); }
+  .banner { border: 1px solid var(--down); background: var(--down-wash);
+    border-radius: 10px; padding: 12px 16px; margin-top: 18px; font-size: 14px; }
+  footer { margin-top: 26px; font-size: 12px; color: var(--dim); font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div>
+      <div class="eyebrow">Цифры за всё время наблюдения</div>
+      <h1>onion<span>watch</span> — статистика</h1>
+    </div>
+    <div class="top-right">
+      <nav class="nav" aria-label="Разделы">
+        <a href="/">Дашборд</a>
+        <a href="/news">Новости</a>
+        <a href="/stats" aria-current="page">Статистика</a>
+        <a href="/admin" data-admin hidden>Админка</a>
+        <button type="button" class="theme" id="theme">
+          <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4.2"/>
+            <path d="M12 2.3v2.3M12 19.4v2.3M4.2 4.2l1.7 1.7M18.1 18.1l1.7 1.7M2.3 12h2.3M19.4 12h2.3M4.2 19.8l1.7-1.7M18.1 5.9l1.7-1.7"/>
+          </svg>
+          <svg class="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20.5 14.6A8.6 8.6 0 0 1 9.4 3.5a8.6 8.6 0 1 0 11.1 11.1Z"/>
+          </svg>
+        </button>
+      </nav>
+      <div class="meta" id="meta"></div>
+    </div>
+  </header>
+
+  <div id="banner"></div>
+  <div id="page"></div>
+
+  <footer id="foot"></footer>
+</div>
+
+<script>
+const REFRESH_MS = 60000;      // цифры за сутки и неделю меняются небыстро
+const TARGET_ROWS = 12;        // сколько целей помещается в список аптайма
+let data = null, hover = null, timer = null;
+
+const el = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const ms = v => v == null ? "—" : (v >= 10000 ? (v/1000).toFixed(1) + " с" : Math.round(v) + " мс");
+const pct = v => v == null ? "—" : (v >= 99.95 ? "100" : v.toFixed(v >= 10 ? 1 : 2)) + "%";
+const num = v => (v == null ? 0 : v).toLocaleString("ru-RU");
+const grade = v => v == null ? "none" : v >= 99 ? "good" : v >= 95 ? "warn" : "bad";
+const clock = ts => new Date(ts*1000).toLocaleTimeString("ru-RU");
+const ago = ts => {
+  const d = Math.max(0, Date.now()/1000 - ts);
+  if (d < 60) return Math.round(d) + " с назад";
+  if (d < 3600) return Math.round(d/60) + " мин назад";
+  if (d < 86400) return Math.round(d/3600) + " ч назад";
+  return Math.round(d/86400) + " д назад";
+};
+// День приходит как ГГГГ-ММ-ДД — местная дата сервера, а не UTC: разбираем
+// сами, иначе браузер прочитает строку как полночь UTC и сдвинет её на день.
+const dayLabel = s => { const [, m, d] = s.split("-"); return `${d}.${m}`; };
+// «51 проверок» на странице со статистикой читается как опечатка, а числа тут
+// в каждой второй строке — поэтому форма слова выбирается по числу.
+const plural = (n, one, few, many) => {
+  const tail = Math.abs(n) % 100, last = tail % 10;
+  if (tail > 10 && tail < 20) return many;
+  return last === 1 ? one : last > 1 && last < 5 ? few : many;
+};
+const say = (n, ...forms) => num(n) + " " + plural(n, ...forms);
+
+// Причины отказов приходят слугами — теми же, что пишутся в историю проверок.
+// Слова к ним живут здесь: на странице нужен человеческий текст, а в базе —
+// стабильный ключ, который переживёт правку формулировки.
+const REASON = {
+  tor_down: "SOCKS-порт Tor не отвечает",
+  timeout: "таймаут",
+  connection: "соединение оборвалось",
+  internal: "внутренняя ошибка проверки",
+  text_missing: "в ответе нет ожидаемой строки",
+  socks_error: "неизвестный код SOCKS",
+  general_failure: "общий сбой SOCKS-прокси",
+  not_allowed: "соединение запрещено правилами прокси",
+  net_unreachable: "сеть недоступна",
+  host_unreachable: "хост недоступен",
+  refused: "соединение отклонено",
+  ttl_expired: "TTL истёк",
+  cmd_unsupported: "команда не поддерживается",
+  atyp_unsupported: "тип адреса не поддерживается",
+  descriptor_not_found: "дескриптор не найден в HSDir",
+  descriptor_invalid: "дескриптор повреждён",
+  intro_failed: "не связались с introduction point",
+  rendezvous_failed: "не построена rendezvous-цепочка",
+  client_auth_missing: "нужна клиентская авторизация",
+  client_auth_wrong: "клиентская авторизация отклонена",
+  bad_onion_address: "некорректный onion-адрес",
+  intro_timeout: "таймаут на introduction point",
+  unknown: "причина не записана",
+};
+const reason = slug => REASON[slug] || slug;
+
+// -- график ----------------------------------------------------------------
+
+// Шкала аптайма почти всегда прижата к сотне: от нуля график был бы прямой
+// линией у потолка. Низ берём чуть ниже худшего дня и подписываем его на оси —
+// обрезанная шкала честна, только когда её край видно.
+function floorOf(values) {
+  if (!values.length) return 90;
+  const low = Math.min(...values);
+  if (low >= 99.5) return 99;
+  return Math.max(0, Math.floor(low - (100 - low) * 0.35));
+}
+
+function colors() {
+  const cs = getComputedStyle(document.documentElement);
+  const get = name => cs.getPropertyValue(name).trim();
+  return { up: get("--up"), down: get("--down"), line: get("--line"),
+           dim: get("--dim"), muted: get("--muted"), panel: get("--panel"),
+           mono: get("--mono") };
+}
+
+// Заливка под линией — не сплошная плашка, а точечный узор: он остаётся
+// читаемым и на печати, и при цветовой слепоте, и не спорит с сеткой.
+function dither(ctx, color) {
+  const tile = document.createElement("canvas");
+  tile.width = tile.height = 6;
+  const t = tile.getContext("2d");
+  t.fillStyle = color;
+  t.fillRect(0, 0, 1.6, 1.6);
+  t.fillRect(3, 3, 1.6, 1.6);
+  return ctx.createPattern(tile, "repeat");
+}
+
+function fit(canvas, height) {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const width = canvas.clientWidth || canvas.parentNode.clientWidth;
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  canvas.style.height = height + "px";
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);   // дальше рисуем в CSS-пикселях
+  ctx.clearRect(0, 0, width, height);
+  return { ctx, W: width, H: height };
+}
+
+const PAD = { left: 38, right: 10, top: 12, bottom: 22 };
+
+function xAt(i, W, n) {
+  if (n < 2) return PAD.left;
+  return PAD.left + i * (W - PAD.left - PAD.right) / (n - 1);
+}
+
+function drawUptime() {
+  const canvas = el("chart");
+  if (!canvas) return;
+  const days = data.days, n = days.length;
+  const { ctx, W, H } = fit(canvas, 180);
+  const c = colors();
+  const known = days.filter(d => d.uptime != null).map(d => d.uptime);
+  const low = floorOf(known);
+  const yAt = v => H - PAD.bottom - (v - low) / (100 - low) * (H - PAD.top - PAD.bottom);
+
+  // Сетка и подписи оси: низ, середина и сто процентов.
+  ctx.font = "10px " + c.mono;
+  ctx.textBaseline = "middle";
+  for (const v of [low, (low + 100) / 2, 100]) {
+    const y = Math.round(yAt(v)) + 0.5;
+    ctx.strokeStyle = c.line; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(W - PAD.right, y); ctx.stroke();
+    ctx.fillStyle = c.dim;
+    ctx.fillText(v.toFixed(v % 1 ? 1 : 0) + "%", 0, y);
+  }
+
+  // Дни без единой проверки разрывают линию: соединять их — рисовать данные,
+  // которых нет. Поэтому линия идёт кусками из подряд идущих дней.
+  const runs = [];
+  days.forEach((d, i) => {
+    if (d.uptime == null) return;
+    const last = runs[runs.length - 1];
+    if (last && last[last.length - 1].i === i - 1) last.push({ i, v: d.uptime });
+    else runs.push([{ i, v: d.uptime }]);
+  });
+  for (const run of runs) {
+    if (run.length > 1) {
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(xAt(run[0].i, W, n), H - PAD.bottom);
+      for (const p of run) ctx.lineTo(xAt(p.i, W, n), yAt(p.v));
+      ctx.lineTo(xAt(run[run.length - 1].i, W, n), H - PAD.bottom);
+      ctx.closePath();
+      ctx.clip();
+      ctx.fillStyle = dither(ctx, c.up);
+      ctx.fillRect(0, 0, W, H);
+      ctx.restore();
+    }
+    ctx.strokeStyle = c.up; ctx.lineWidth = 2; ctx.lineJoin = "round";
+    ctx.beginPath();
+    run.forEach((p, k) => {
+      const x = xAt(p.i, W, n), y = yAt(p.v);
+      k ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    if (run.length === 1) {   // одинокий день: точка вместо линии
+      ctx.fillStyle = c.up;
+      ctx.beginPath();
+      ctx.arc(xAt(run[0].i, W, n), yAt(run[0].v), 3, 0, 2 * Math.PI);
+      ctx.fill();
+    } else ctx.stroke();
+  }
+
+  // Даты по низу — не все подряд: «22.08» занимает около 34 пикселей, и на
+  // узком экране четырнадцать подписей слились бы в полосу. Шаг считаем от
+  // ширины и отсчитываем от последнего дня — он на графике главный.
+  // Крайние прижимаются к краям, иначе последняя вылезает за канву.
+  const gap = (W - PAD.left - PAD.right) / Math.max(1, n - 1);
+  const every = Math.max(1, Math.ceil(38 / gap));
+  ctx.fillStyle = c.dim;
+  days.forEach((d, i) => {
+    if ((n - 1 - i) % every) return;
+    ctx.textAlign = i === n - 1 ? "right" : i === 0 ? "left" : "center";
+    ctx.fillText(dayLabel(d.day), xAt(i, W, n), H - PAD.bottom / 2);
+  });
+  ctx.textAlign = "start";
+
+  // Последний день подписан прямо у точки: его и ищут глазами в первую очередь.
+  const last = days[n - 1];
+  if (last && last.uptime != null) {
+    const x = xAt(n - 1, W, n), y = yAt(last.uptime);
+    ctx.fillStyle = c.panel;
+    ctx.beginPath(); ctx.arc(x, y, 5, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.up;
+    ctx.beginPath(); ctx.arc(x, y, 3.2, 0, 2 * Math.PI); ctx.fill();
+  }
+
+  // Отметка под курсором.
+  if (hover != null && days[hover] && days[hover].uptime != null) {
+    const x = xAt(hover, W, n), y = yAt(days[hover].uptime);
+    ctx.strokeStyle = c.dim; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(x, PAD.top); ctx.lineTo(x, H - PAD.bottom); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.panel;
+    ctx.beginPath(); ctx.arc(x, y, 5.5, 0, 2 * Math.PI); ctx.fill();
+    ctx.fillStyle = c.up;
+    ctx.beginPath(); ctx.arc(x, y, 3.5, 0, 2 * Math.PI); ctx.fill();
+  }
+}
+
+// Недоступные проверки по дням — отдельная полоска под графиком аптайма,
+// а не вторая шкала на нём: у процентов и штук нет общей оси.
+function drawFails() {
+  const canvas = el("fails");
+  if (!canvas) return;
+  const days = data.days, n = days.length;
+  const { ctx, W, H } = fit(canvas, 46);
+  const c = colors();
+  const worst = Math.max(1, ...days.map(d => d.checks - d.alive));
+  const base = H - 12;
+  ctx.strokeStyle = c.line; ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(PAD.left, base + 0.5); ctx.lineTo(W - PAD.right, base + 0.5); ctx.stroke();
+  const step = n > 1 ? (W - PAD.left - PAD.right) / (n - 1) : W;
+  const width = Math.max(3, Math.min(18, step * 0.5));
+  days.forEach((d, i) => {
+    const fails = d.checks - d.alive;
+    if (!fails) return;
+    const h = Math.max(2, (H - 14) * fails / worst);
+    const x = xAt(i, W, n) - width / 2;
+    ctx.fillStyle = c.down;
+    // Скруглять верх столбика умеет не всякий браузер: без roundRect
+    // рисуется тот же столбик с прямым верхом.
+    if (ctx.roundRect) {
+      ctx.beginPath();
+      ctx.roundRect(x, base - h, width, h, [3, 3, 0, 0]);
+      ctx.fill();
+    } else ctx.fillRect(x, base - h, width, h);
+  });
+}
+
+function redraw() {
+  if (!data) return;
+  drawUptime();
+  drawFails();
+}
+
+// Подсказка на графике: день под курсором ищется по ближайшей точке.
+function bindHover() {
+  const plot = el("plot"), canvas = el("chart"), tip = el("tip");
+  if (!plot) return;
+  const move = ev => {
+    const box = canvas.getBoundingClientRect(), n = data.days.length;
+    const x = ev.clientX - box.left;
+    let best = 0, dist = Infinity;
+    for (let i = 0; i < n; i++) {
+      const d = Math.abs(xAt(i, box.width, n) - x);
+      if (d < dist) { dist = d; best = i; }
+    }
+    if (best === hover) return;
+    hover = best;
+    const day = data.days[best];
+    const fails = day.checks - day.alive;
+    tip.innerHTML = `<b>${esc(dayLabel(day.day))}</b> · `
+      + (day.uptime == null ? "проверок не было"
+         : `${esc(pct(day.uptime))} · ${esc(say(day.checks, "проверка", "проверки", "проверок"))}`
+           + (fails ? ` · <b>недоступных</b> ${esc(num(fails))}` : ""));
+    tip.classList.add("on");
+    tip.style.left = Math.round(xAt(best, box.width, n)) + "px";
+    tip.style.top = "6px";
+    redraw();
+  };
+  plot.addEventListener("mousemove", move);
+  plot.addEventListener("mouseleave", () => {
+    hover = null; tip.classList.remove("on"); redraw();
+  });
+}
+
+// -- разметка --------------------------------------------------------------
+
+function tile(k, value, cls, sub) {
+  return `<div class="card"><div class="k">${esc(k)}</div>
+    <div class="n ${cls || ""}">${esc(value)}</div>
+    <div class="s">${esc(sub)}</div></div>`;
+}
+
+function row(who, value, share, cls) {
+  return `<div class="row">
+    <span class="who" title="${esc(who)}">${esc(who)}</span>
+    <span class="bar ${cls || ""}"><i style="width:${Math.max(2, Math.round(share * 100))}%"></i></span>
+    <span class="num">${esc(value)}</span>
+  </div>`;
+}
+
+function uptimeList() {
+  // Сначала худшие: список читают, чтобы найти, что чинить, а не чтобы
+  // полюбоваться сотней процентов у остальных.
+  const all = data.targets.slice().sort((a, b) =>
+    (a.uptime == null) - (b.uptime == null) || a.uptime - b.uptime);
+  const shown = all.slice(0, TARGET_ROWS);
+  const rest = all.length - shown.length;
+  // Полоса меряется от нижнего края шкалы, а не от нуля: у 99% и 97% полоски
+  // «в сотую долю» неразличимы, а разница между ними — вся суть.
+  const low = floorOf(all.filter(x => x.uptime != null).map(x => x.uptime));
+  const rows = shown.map(t => {
+    const share = t.uptime == null ? 0 : (t.uptime - low) / (100 - low);
+    return row(t.name, t.checks ? pct(t.uptime) : "нет проверок",
+               Math.max(0, Math.min(1, share)), grade(t.uptime));
+  }).join("");
+  return rows + (rest > 0
+    ? `<div class="s" style="margin-top:9px">и ещё ${say(rest, "цель", "цели", "целей")} — весь список на
+       <a href="/" style="color:var(--circuit)">дашборде</a></div>` : "");
+}
+
+function reasonList() {
+  if (!data.errors.length) {
+    return `<div class="s" style="margin-top:10px">За неделю ни одна проверка не провалилась.</div>`;
+  }
+  const worst = Math.max(...data.errors.map(e => e.checks));
+  return data.errors.map(e =>
+    row(reason(e.slug), num(e.checks) + " пр.", e.checks / worst, "bad")).join("");
+}
+
+function events() {
+  if (!data.recent.length) {
+    return `<div class="s">Ни одного отказа в сохранённой истории.</div>`;
+  }
+  return `<div class="events">` + data.recent.map(r => `<div class="event">
+      <span class="when">${esc(ago(r.ts))}</span>
+      <span class="who">${esc(r.target)}</span>
+      <span class="why">${esc(reason(r.error_slug || "unknown"))}${
+        (r.attempts || 1) > 1 ? ` · попыток: ${r.attempts}` : ""}</span>
+    </div>`).join("") + `</div>`;
+}
+
+function render() {
+  if (!data) return;
+  el("meta").innerHTML =
+    `<span><span class="dot ${data.tor_ok ? "on" : "off"}"></span>tor ${esc(data.tor_socks)}</span>`
+    + `<span>обновлено ${clock(data.generated_at)}</span>`;
+
+  el("banner").innerHTML = data.tor_ok ? "" :
+    `<div class="banner">SOCKS-порт Tor не отвечает по адресу ${esc(data.tor_socks)}.
+     Пока демон tor не запущен, статистика будет набирать недоступность.</div>`;
+
+  const now = data.now, day = data.day, week = data.week;
+  if (!now.targets) {
+    el("page").innerHTML = `<div class="empty-state" style="margin-top:22px">
+      Считать пока нечего: ни одной цели не заведено.<br>
+      Добавьте onion-адреса в <a href="/admin">админке</a>.</div>`;
+    el("foot").textContent = "";
+    return;
+  }
+
+  const total = Math.max(1, now.targets);
+  // Худший день окна называется словами: на полоске под графиком у него нет
+  // своей подписи, а без числа высота столбика ни о чём не говорит.
+  const worstDay = Math.max(0, ...data.days.map(d => d.checks - d.alive));
+  el("page").innerHTML = `
+    <section class="tiles" aria-label="Сводка">
+      ${tile("аптайм 24 ч", pct(day.uptime), grade(day.uptime),
+             `${say(day.checks, "проверка", "проверки", "проверок")} по всем целям`)}
+      ${tile("аптайм 7 дней", pct(week.uptime), grade(week.uptime),
+             `${say(week.checks, "проверка", "проверки", "проверок")} за неделю`)}
+      ${tile("недоступности", num(now.incidents), now.incidents ? "bad" : "good",
+             "переходов в недоступность за 7 дней")}
+      ${tile("время ответа", ms(week.avg_ttfb_ms), "",
+             `цепочка ${ms(week.avg_circuit_ms)} · среднее за неделю`)}
+    </section>
+
+    <h2>Аптайм по дням · ${data.window_days} дней</h2>
+    <div class="card">
+      <div class="k">доля проверок, в которых цель была на связи</div>
+      <div class="plot" id="plot">
+        <div class="tip" id="tip" role="status"></div>
+        <canvas id="chart" role="img"
+          aria-label="График аптайма по дням за ${data.window_days} дней"></canvas>
+        <canvas id="fails" role="img"
+          aria-label="Недоступные проверки по дням"></canvas>
+      </div>
+      <div class="axis">
+        <span><span class="sw" style="background:var(--up)"></span>аптайм за день</span>
+        <span><span class="sw" style="background:var(--down)"></span>недоступные проверки${
+          worstDay ? ` · до ${num(worstDay)} за день` : " · ни одной"}</span>
+        <span>история хранится ${say(data.retention_days, "день", "дня", "дней")}</span>
+      </div>
+    </div>
+
+    <h2>Прямо сейчас</h2>
+    <div class="card">
+      <div class="live">
+        <div>
+          <div class="n ${now.down ? "bad" : "good"}" style="font-size:36px">${now.up} из ${now.targets}</div>
+          <div class="s">целей на связи${now.pending ? ` · ${now.pending} ещё не проверялись` : ""}</div>
+        </div>
+        <div style="flex:1;min-width:240px">
+          <div class="k" style="margin-bottom:2px">последние отказы</div>
+          ${events()}
+        </div>
+      </div>
+    </div>
+
+    <div class="cols">
+      <div class="card">
+        <div class="k">аптайм по целям · 7 дней</div>
+        ${uptimeList()}
+      </div>
+      <div class="card">
+        <div class="k">почему падали · 7 дней</div>
+        ${reasonList()}
+      </div>
+    </div>
+
+    <h2>Цели и адреса</h2>
+    <section class="tiles" style="margin-top:0">
+      ${tile("целей", num(now.targets), "",
+             `${say(now.addresses, "адрес", "адреса", "адресов")} под наблюдением`)}
+      ${tile("доступны", num(now.up), now.up === now.targets ? "good" : now.up ? "" : "none",
+             "отвечает хотя бы один адрес")}
+      ${tile("недоступны", num(now.down), now.down ? "bad" : "none", "не отвечает ни один адрес")}
+      ${tile("onion-адресов", num(now.onion), "",
+             now.clear ? `и ${say(now.clear, "обычный адрес", "обычных адреса", "обычных адресов")}`
+                       : "обычных адресов нет")}
+    </section>
+    <div class="card" style="margin-top:10px">
+      <div class="split" role="img"
+        aria-label="Доступны ${now.up}, недоступны ${now.down}, в очереди ${now.pending}">
+        ${now.up ? `<i class="up" style="flex:${now.up}"></i>` : ""}
+        ${now.down ? `<i class="down" style="flex:${now.down}"></i>` : ""}
+        ${now.pending ? `<i class="pending" style="flex:${now.pending}"></i>` : ""}
+      </div>
+      <div class="legend">
+        <span><span class="sw" style="background:var(--up)"></span>доступны ${now.up}</span>
+        <span><span class="sw" style="background:var(--down)"></span>недоступны ${now.down}</span>
+        <span><span class="sw" style="background:var(--dim)"></span>в очереди ${now.pending}</span>
+        <span>${Math.round(100 * now.up / total)}% целей на связи</span>
+      </div>
+    </div>`;
+
+  el("foot").textContent =
+    `${say(data.checks_total, "проверка", "проверки", "проверок")} в базе`
+    + (data.since ? ` · история с ${new Date(data.since*1000).toLocaleDateString("ru-RU")}` : "")
+    + ` · страница обновляется раз в ${REFRESH_MS/1000} с`;
+
+  hover = null;
+  bindHover();
+  redraw();
+}
+
+async function load() {
+  try {
+    const r = await fetch("/api/stats", { cache: "no-store" });
+    if (r.status === 401) { location.href = "/admin"; return; }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    data = await r.json();
+    render();
+  } catch (e) {
+    el("banner").innerHTML =
+      `<div class="banner">Статистика не загрузилась: ${esc(e.message)}.
+       Проверьте, что процесс onionwatch запущен.</div>`;
+  }
+}
+
+window.addEventListener("resize", redraw);
+
+// Дашборд, новости и статистика открыты всем, ссылка на админку появляется,
+// только когда /api/session подтверждает вход.
+async function navForAdmin() {
+  try {
+    const s = await (await fetch("/api/session", { cache: "no-store" })).json();
+    if (!s.authed) return;
+    for (const a of document.querySelectorAll("nav.nav a[data-admin]")) a.hidden = false;
+  } catch (e) { /* не ответили — ссылка на админку просто не появится */ }
+}
+
+// Переключатель темы. Выбор запоминается и переживает перезагрузку; пока его
+// не сделали, страница идёт за системной темой (см. скрипт в head). График
+// рисуется цветами темы и поэтому перерисовывается вместе с ней.
+(function () {
+  const root = document.documentElement, btn = el("theme");
+  const sync = () => {
+    const light = root.dataset.theme === "light";
+    const to = light ? "тёмную" : "светлую";
+    btn.setAttribute("aria-pressed", String(light));
+    btn.setAttribute("aria-label", "Переключить на " + to + " тему");
+    btn.title = "Переключить на " + to + " тему";
+  };
+  btn.addEventListener("click", () => {
+    root.dataset.theme = root.dataset.theme === "light" ? "dark" : "light";
+    try { localStorage.setItem("ow-theme", root.dataset.theme); } catch (e) { /* приватный режим */ }
+    sync();
+    redraw();
+  });
+  sync();
+})();
+
+navForAdmin();
+load();
+timer = setInterval(load, REFRESH_MS);
+</script>
+</body>
+</html>
