@@ -45,6 +45,7 @@
   nav.nav a:hover { background: var(--panel-2); border-color: #3a4270; color: var(--text); }
   nav.nav a[aria-current="page"] { color: #fff; border-color: var(--circuit);
     background: linear-gradient(var(--panel-2), var(--panel)); }
+  nav.nav a[hidden] { display: none; }
   :focus-visible { outline: 2px solid var(--circuit); outline-offset: 2px; }
 
   .feed { display: flex; flex-direction: column; gap: 16px; margin-top: 22px; }
@@ -115,9 +116,9 @@
     </div>
     <div class="top-right">
       <nav class="nav" aria-label="Разделы">
-        <a href="/">Дашборд</a>
+        <a href="/" data-admin hidden>Дашборд</a>
         <a href="/news" aria-current="page">Новости</a>
-        <a href="/admin">Админка</a>
+        <a href="/admin" data-admin hidden>Админка</a>
       </nav>
     </div>
   </header>
@@ -247,6 +248,17 @@ el("pager").addEventListener("click", ev => {
 
 window.addEventListener("popstate", () => load(pageFromUrl()));
 
+// Обычный посетитель видит в меню только «Новости»: дашборд и админка
+// появляются, когда /api/session подтверждает вход под админом.
+async function navForAdmin() {
+  try {
+    const s = await (await fetch("/api/session", { cache: "no-store" })).json();
+    if (!s.authed) return;
+    for (const a of document.querySelectorAll("nav.nav a[data-admin]")) a.hidden = false;
+  } catch (e) { /* не ответили — меню просто останется без админских ссылок */ }
+}
+
+navForAdmin();
 load(pageFromUrl());
 </script>
 </body>

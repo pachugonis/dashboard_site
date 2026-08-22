@@ -41,6 +41,7 @@
   nav.nav a:hover { background: var(--panel-2); border-color: #3a4270; color: var(--text); }
   nav.nav a[aria-current="page"] { color: #fff; border-color: var(--circuit);
     background: linear-gradient(var(--panel-2), var(--panel)); }
+  nav.nav a[hidden] { display: none; }
 
   /* Вкладки: цели и новости — две разные работы, и делать их на одной
      простыне незачем. Первая панель вкладки сама отбивает её сверху. */
@@ -143,9 +144,9 @@
     </div>
     <div class="top-right">
       <nav class="nav" aria-label="Разделы">
-        <a href="/">Дашборд</a>
+        <a href="/" data-admin hidden>Дашборд</a>
         <a href="/news">Новости</a>
-        <a href="/admin" aria-current="page">Админка</a>
+        <a href="/admin" aria-current="page" data-admin hidden>Админка</a>
       </nav>
       <div class="meta" id="meta"></div>
     </div>
@@ -620,6 +621,9 @@ async function api(method, url, body) {
 function show(authed) {
   el("login-view").classList.toggle("hidden", authed);
   el("admin-view").classList.toggle("hidden", !authed);
+  // Обычный посетитель видит в меню только «Новости»: дашборд и админка
+  // появляются лишь после входа под админом.
+  for (const a of document.querySelectorAll("nav.nav a[data-admin]")) a.hidden = !authed;
 }
 
 // -- вкладки ---------------------------------------------------------------
