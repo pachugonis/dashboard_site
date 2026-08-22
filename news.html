@@ -26,8 +26,8 @@
     background-image: radial-gradient(circle at 15% -10%, #1d2244 0%, transparent 55%);
     background-attachment: fixed;
   }
-  /* Лента читается, а не просматривается: колонка уже дашбордной. */
-  .wrap { max-width: 820px; margin: 0 auto; padding: 28px 20px 64px; }
+  /* Та же ширина, что у дашборда: страницы одного сайта не должны разъезжаться. */
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 28px 20px 64px; }
 
   .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: .18em;
     text-transform: uppercase; color: var(--dim); }
@@ -56,9 +56,32 @@
      по колонке, высоту ограничиваем, чтобы вертикальный кадр не занимал экран. */
   .shot { display: block; width: 100%; height: auto; max-height: 460px;
     object-fit: contain; border-radius: 10px; border: 1px solid var(--line);
-    background: var(--panel-2); margin: 12px 0 4px; }
-  .body { font-size: 15.5px; }
+    background: var(--panel-2); margin: 12px 0 0; }
+  .text { margin-top: 12px; }
+  /* Строка длиной во весь дашборд не читается — ширину берёт на себя вёрстка
+     новости, а не сам абзац. */
+  .body { font-size: 15.5px; max-width: 74ch; }
   .body p { margin: 12px 0 0; overflow-wrap: anywhere; }
+  .body p:first-child { margin-top: 0; }
+
+  /* На широком экране картинка встаёт слева, текст справа: страница занимает
+     ту же ширину, что и дашборд, и не оставляет полполосы пустой. Ниже 900
+     пикселей они снова идут друг под другом. */
+  @media (min-width: 900px) {
+    .post.with-shot { display: grid; align-items: start; column-gap: 22px;
+      grid-template-columns: minmax(0, 420px) minmax(0, 1fr);
+      grid-template-areas: "when when" "shot text"; }
+    .post.with-shot .when { grid-area: when; }
+    .post.with-shot .shot { grid-area: shot; }
+    .post.with-shot .text { grid-area: text; }
+  }
+  /* Источник — отдельная строка под текстом, а не слово внутри него. */
+  .source { margin: 14px 0 0; }
+  .source a { font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+    text-decoration: none; color: var(--muted); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 6px 11px;
+    display: inline-block; }
+  .source a:hover { color: var(--text); border-color: #3a4270; }
 
   .empty-state { border: 1px dashed var(--line); border-radius: 12px; padding: 44px 24px;
     text-align: center; color: var(--muted); }
@@ -88,7 +111,7 @@
   <div id="banner"></div>
   <div class="feed" id="feed"></div>
 
-  <footer>новости публикуются в админке · картинка и текст к ней</footer>
+  <footer>новости публикуются в админке · картинка, текст и ссылка на источник</footer>
 </div>
 
 <script>
@@ -109,10 +132,24 @@ function post(n) {
   const shot = n.has_image
     ? `<img class="shot" src="/api/news/${n.id}/image?v=${n.image_v}" alt="Изображение к новости">`
     : "";
-  return `<article class="post" id="n${n.id}">
+  // Первоисточник — отдельной ссылкой в конце новости, а не внутри текста.
+  // Открывается в новом окне: no-referrer и noopener, чтобы страница по ту
+  // сторону не узнала, откуда пришли, и не дотянулась до ленты.
+  const source = n.source
+    ? `<p class="source"><a href="${esc(n.source)}" target="_blank"
+         rel="noopener noreferrer nofollow" title="${esc(n.source)}"
+         aria-label="Источник: ${esc(n.source)}, откроется в новом окне"
+         >Источник<span aria-hidden="true"> ↗</span></a></p>`
+    : "";
+  // Класс with-shot включает двухколоночную раскладку: без картинки колонке
+  // слева нечего занимать, и текст идёт как обычно.
+  return `<article class="post${n.has_image ? " with-shot" : ""}" id="n${n.id}">
     <div class="when">${esc(when(n.created_at))}</div>
     ${shot}
-    <div class="body">${paragraphs(n.text)}</div>
+    <div class="text">
+      <div class="body">${paragraphs(n.text)}</div>
+      ${source}
+    </div>
   </article>`;
 }
 

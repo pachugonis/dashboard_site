@@ -110,6 +110,7 @@ MAX_IMAGE = 5 * 1024 * 1024
 # размера отвергнет не проверка формата, а вот эта — с ошибкой не по делу.
 MAX_BODY = 8 * 1024 * 1024
 MAX_NEWS_TEXT = 4000          # новость — заметка под картинкой, а не статья
+MAX_SOURCE_URL = 500          # ссылка на первоисточник новости
 NEWS_LIMIT = 100              # сколько новостей отдаётся на страницу
 
 # Растр обрезает и уменьшает браузер, сюда приходит готовый квадрат.
@@ -408,12 +409,38 @@ def clean_target(data: dict[str, Any], cfg: Config) -> tuple[dict[str, Any], lis
     return row, urls
 
 
-def clean_news(data: dict[str, Any]) -> str:
-    """Проверяет текст новости. Бросает Invalid с текстом для UI.
+def clean_source(raw: Any) -> str | None:
+    """Ссылка на первоисточник новости: http(s) и ничего больше.
+
+    Схему проверяем до разбора: `javascript:` и `data:` в ленте становятся
+    ссылкой, по которой читатель кликнет, поэтому отказ должен быть здесь,
+    а не в экранировании на странице. Дальше адрес идёт через тот же разбор,
+    что и адреса целей, — он же проверит onion v3 и отсечёт кириллицу.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if len(text) > MAX_SOURCE_URL:
+        raise Invalid(f"Ссылка на источник длиннее {MAX_SOURCE_URL} символов")
+    # Схема — всё до первого двоеточия, но только если оно стоит перед первым
+    # слэшем и за ним не число: в «example.test:8080/x» это порт, а не схема,
+    # и такую запись clean_url принимает, дописывая http://.
+    head = text.split("/", 1)[0]
+    if ":" in head:
+        scheme, _, rest = head.partition(":")
+        if scheme.lower() not in ("http", "https") and not rest.isdigit():
+            raise Invalid(f"Ссылка на источник: схема {scheme.lower()!r} не годится, "
+                          f"нужен http или https")
+    return clean_url(text)
+
+
+def clean_news(data: dict[str, Any]) -> tuple[str, str | None]:
+    """Проверяет новость: текст и ссылку на источник. Бросает Invalid для UI.
 
     Текст хранится как есть, без разметки: страница новостей экранирует его
     и сама разбивает по пустым строкам на абзацы. Картинка к тексту
     необязательна — новость без неё остаётся читаемой, а вот без слов нет.
+    Источник тоже необязателен: своя новость ни на кого не ссылается.
     """
     text = str(data.get("text", "")).replace("\r\n", "\n").strip()
     if not text:
@@ -421,7 +448,7 @@ def clean_news(data: dict[str, Any]) -> str:
     if len(text) > MAX_NEWS_TEXT:
         raise Invalid(f"Текст новости длиннее {MAX_NEWS_TEXT} символов "
                       f"(сейчас {len(text)}) — сократите его")
-    return text
+    return text, clean_source(data.get("source"))
 
 
 def check_svg(blob: bytes) -> None:
@@ -901,6 +928,7 @@ class Store:
                 CREATE TABLE IF NOT EXISTS news (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     text TEXT NOT NULL,
+                    source TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     image BLOB,
@@ -929,6 +957,11 @@ class Store:
             for column, decl in (("image", "BLOB"), ("image_type", "TEXT")):
                 if column not in have:
                     self.db.execute(f"ALTER TABLE targets ADD COLUMN {column} {decl}")
+            # База, заведённая до появления ссылки на первоисточник, этой
+            # колонки не имеет — у старых новостей источника просто нет.
+            have = {r["name"] for r in self.db.execute("PRAGMA table_info(news)")}
+            if "source" not in have:
+                self.db.execute("ALTER TABLE news ADD COLUMN source TEXT")
             # Так же и с историей проверок: попытка была всегда одна, а состояний
             # было два. Старые записи разносим по новой шкале — иначе аптайм за
             # неделю считался бы по половине колонки.
@@ -1181,29 +1214,30 @@ class Store:
         """Лента для страницы новостей: свежие сверху, без самих блобов."""
         with self.lock:
             rows = self.db.execute(
-                "SELECT id, text, created_at, updated_at,"
+                "SELECT id, text, source, created_at, updated_at,"
                 " image IS NOT NULL AS has_image FROM news"
                 " ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)).fetchall()
-        return [{"id": int(r["id"]), "text": r["text"],
+        return [{"id": int(r["id"]), "text": r["text"], "source": r["source"],
                  "created_at": r["created_at"], "updated_at": r["updated_at"],
                  "has_image": bool(r["has_image"]),
                  "image_v": int(r["updated_at"])} for r in rows]
 
-    def add_news(self, text: str) -> int:
+    def add_news(self, text: str, source: str | None = None) -> int:
         now = time.time()
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO news (text, created_at, updated_at) VALUES (?,?,?)",
-                (text, now, now))
+                "INSERT INTO news (text, source, created_at, updated_at) VALUES (?,?,?,?)",
+                (text, source, now, now))
             self.db.commit()
             return int(cur.lastrowid)
 
-    def update_news(self, nid: int, text: str) -> None:
+    def update_news(self, nid: int, text: str, source: str | None = None) -> None:
         with self.lock:
             # created_at не трогаем: правка опечатки не должна поднимать
             # новость обратно наверх ленты.
-            cur = self.db.execute("UPDATE news SET text=?, updated_at=? WHERE id=?",
-                                  (text, time.time(), nid))
+            cur = self.db.execute(
+                "UPDATE news SET text=?, source=?, updated_at=? WHERE id=?",
+                (text, source, time.time(), nid))
             if not cur.rowcount:
                 raise Invalid("Новость не найдена")
             self.db.commit()
@@ -1733,11 +1767,11 @@ def make_handler(monitor: Monitor):
                     if not self._require_admin():
                         return None
                     data = self._body()
-                    text = clean_news(data)
+                    text, source = clean_news(data)
                     # Картинку разбираем до вставки: иначе битый файл оставил бы
                     # в ленте опубликованную новость и ошибку в форме.
                     image = self._image_of(data)
-                    nid = store.add_news(text)
+                    nid = store.add_news(text, source)
                     if image:
                         store.set_news_image(nid, *image)
                     return self._json(201, {"id": nid})
@@ -1776,9 +1810,9 @@ def make_handler(monitor: Monitor):
                         return None
                     nid = self._path_id(path)
                     data = self._body()
-                    text = clean_news(data)
+                    text, source = clean_news(data)
                     image = self._image_of(data)
-                    store.update_news(nid, text)
+                    store.update_news(nid, text, source)
                     if image:
                         store.set_news_image(nid, *image)
                     elif data.get("image_clear"):

@@ -301,6 +301,14 @@
           <div class="hint">До 4000 символов, без разметки. Пустая строка делит
             текст на абзацы, одиночный перенос так и остаётся переносом.</div>
         </div>
+        <div class="wide">
+          <label for="n-source">Первоисточник</label>
+          <input id="n-source" placeholder="https://example.com/статья"
+                 autocapitalize="off" spellcheck="false">
+          <div class="hint">Не обязателен. Если задан, в конце новости появится
+            отдельная ссылка «Источник» — она открывается в новом окне.
+            Годятся только http и https, onion-адрес тоже подойдёт.</div>
+        </div>
       </div>
       <div class="actions">
         <button class="primary" id="n-save">Опубликовать</button>
@@ -933,6 +941,7 @@ function newsRow(n) {
         <div style="min-width:0">
           <div class="n-when">${esc(newsWhen(n.created_at))}</div>
           <div class="n-text">${esc(excerpt(n.text))}</div>
+          ${n.source ? `<div class="t-url">источник: ${esc(n.source)}</div>` : ""}
         </div>
       </div>
     </td>
@@ -964,6 +973,7 @@ async function loadNews() {
 function fillNewsForm(n) {
   editingNews = n ? n.id : null;
   el("n-text").value = n ? n.text : "";
+  el("n-source").value = n ? (n.source || "") : "";
   newsImage = null;
   newsClearImage = false;
   el("n-file").value = "";
@@ -1008,8 +1018,8 @@ el("n-save").addEventListener("click", async () => {
   el("n-save").disabled = true;
   const was = editingNews;
   try {
-    const body = { text: el("n-text").value, image: newsImage,
-                   image_clear: newsClearImage };
+    const body = { text: el("n-text").value, source: el("n-source").value,
+                   image: newsImage, image_clear: newsClearImage };
     if (was) await api("PUT", "/api/admin/news/" + was, body);
     else await api("POST", "/api/admin/news", body);
     fillNewsForm(null);

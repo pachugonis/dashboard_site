@@ -509,6 +509,47 @@ async def main() -> int:
                         ("слишком длинный текст", {"text": "я" * 4001})]:
         check(label + " отклонена", api("POST", "/api/admin/news", body)[0], 400)
 
+    print("\n8а. Первоисточник новости")
+    check("новость без источника", feed[0]["source"], None)
+    code, cited = api("POST", "/api/admin/news",
+                      {"text": "Со ссылкой", "source": "https://example.test/статья"})
+    check("новость с источником опубликована", code, 201)
+    check("источник вернулся в ленте",
+          api("GET", "/api/news")[1]["news"][0]["source"], "https://example.test/статья")
+    check("onion годится в источники",
+          api("PUT", f"/api/admin/news/{cited.get('id')}",
+              {"text": "Со ссылкой", "source": f"http://{GOOD}/post"})[0], 200)
+    check("схема дописывается, как и у целей",
+          (api("PUT", f"/api/admin/news/{cited.get('id')}",
+               {"text": "Со ссылкой", "source": "example.test/x"}),
+           api("GET", "/api/news")[1]["news"][0]["source"])[1], "http://example.test/x")
+    check("пустой источник убирает ссылку",
+          (api("PUT", f"/api/admin/news/{cited.get('id')}",
+               {"text": "Со ссылкой", "source": "  "}),
+           api("GET", "/api/news")[1]["news"][0]["source"])[1], None)
+
+    # Источник становится в ленте ссылкой, по которой читатель кликнет:
+    # схему проверяем на входе, а не надеемся на экранирование при показе.
+    for label, source in [("javascript в источнике", "javascript:alert(1)"),
+                          ("javascript со слэшами", "javascript://example.test/%0aalert(1)"),
+                          ("data в источнике", "data:text/html;base64,PGh0bWw+"),
+                          ("tcp в источнике", f"tcp://{GOOD}:22"),
+                          ("огрызок onion в источнике", "http://short.onion/"),
+                          ("слишком длинная ссылка", "https://example.test/" + "x" * 500)]:
+        check(label + " отклонён",
+              api("POST", "/api/admin/news", {"text": label, "source": source})[0], 400)
+    check("адрес с портом, но без схемы — это не чужая схема",
+          (api("PUT", f"/api/admin/news/{cited.get('id')}",
+               {"text": "Со ссылкой", "source": "example.test:8080/x"}),
+           api("GET", "/api/news")[1]["news"][0]["source"])[1], "http://example.test:8080/x")
+    # Отказ должен называть схему, а не сыпать разбором портов из urlsplit.
+    check("отказ объясняет, что не так со схемой",
+          "javascript" in api("POST", "/api/admin/news",
+                              {"text": "x", "source": "javascript:alert(1)"})[1]["error"], True)
+    check("отклонённые источники новостей не наплодили",
+          len(api("GET", "/api/news")[1]["news"]), 3)
+    api("DELETE", f"/api/admin/news/{cited.get('id')}")
+
     # Картинку разбираем до вставки: иначе битый файл оставлял бы в ленте
     # опубликованную новость и ошибку в форме одновременно.
     check("новость с битой картинкой отклонена",
@@ -572,6 +613,17 @@ async def main() -> int:
           "object-fit: contain" in pages["dashboard.html"], True)
     check("картинку новости тоже не режет",
           "object-fit: contain" in pages["news.html"], True)
+    # Ссылка на первоисточник уводит наружу: она обязана открываться в новом
+    # окне и не давать той странице дотянуться до ленты.
+    news_code = pages["news.html"]
+    # Страницы одного сайта не должны разъезжаться по ширине: колонка ленты
+    # задаётся тем же .wrap, что и на дашборде.
+    width = lambda page: re.search(r"\.wrap \{ max-width: (\d+)px", pages[page]).group(1)
+    check("лента новостей шириной с дашборд",
+          width("news.html"), width("dashboard.html"))
+    check("в ленте есть ссылка «Источник»", ">Источник" in news_code, True)
+    check("источник открывается в новом окне и без opener",
+          'target="_blank"' in news_code and "noopener" in news_code, True)
 
     # Ссылка на новости — в верхнем меню каждой страницы: заводится она руками
     # в трёх файлах, и забытая находится только глазами.
@@ -660,6 +712,26 @@ async def main() -> int:
     check("повторное открытие базы адрес не задваивает",
           [a.url for a in ow.Store(old_path).list_targets(cfg)[0].addresses],
           [f"http://{GOOD}/"])
+
+    # База с новостями, но без ссылки на первоисточник: колонка добавляется
+    # на месте, у старых новостей источника просто нет.
+    old_path = os.path.join(tmp, "old-news.db")
+    old = sqlite3.connect(old_path)
+    old.executescript("""
+        CREATE TABLE news (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL,
+          created_at REAL NOT NULL, updated_at REAL NOT NULL,
+          image BLOB, image_type TEXT);
+        INSERT INTO news (text, created_at, updated_at)
+          VALUES ('старая новость', 1000000000, 1000000000);
+    """)
+    old.commit(); old.close()
+    migrated = ow.Store(old_path)
+    check("у старой новости источник пуст, а сама она цела",
+          [(n["text"], n["source"]) for n in migrated.list_news()],
+          [("старая новость", None)])
+    check("источник дописывается в старую новость",
+          (migrated.update_news(1, "старая новость", "https://example.test/"),
+           migrated.list_news()[0]["source"])[1], "https://example.test/")
 
     httpd.shutdown()
     print("\nПровалов:", len(fails) or "нет", *(f"\n  - {f}" for f in fails))
